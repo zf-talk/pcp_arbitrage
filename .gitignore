@@ -1,0 +1,31 @@
+# Live config with API credentials — never commit
+config.yaml
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+.ruff_cache/
+
+# IDE / tooling
+.claude/
+.DS_Store
+
+# Internal planning / design docs (AI-generated, not part of the project)
+docs/superpowers/
+
+# Lock file — commit if you want reproducible installs, otherwise ignore
+# uv.lock
+
+.vscode/sftp.json
+
+data/
+.vscode
+
+# Git worktrees
+.worktrees/

@@ -1,0 +1,72 @@
+exchanges:
+  okx:
+    enabled: true
+    arbitrage_enabled: false  # 是否开启自动套利交易（需配置 api_key）
+    margin_type: coin        # coin = BTC/ETH settled; usdt = USDT settled
+    api_key: ""
+    secret_key: ""
+    passphrase: ""
+    is_paper_trading: false
+
+  binance:
+    enabled: false
+    margin_type: usdt
+    api_key: ""
+    secret_key: ""
+
+  deribit:
+    enabled: false
+    margin_type: coin
+    api_key: ""              # client_id
+    secret_key: ""           # client_secret
+
+  deribit_linear:
+    enabled: false
+    margin_type: usdc
+    api_key: ""              # same client_id as deribit
+    secret_key: ""           # same client_secret as deribit
+
+arbitrage:
+  min_annualized_rate: 0.010  # minimum annualized return to print signal (1%)
+  order_min_annualized_rate: 0.05   # send Telegram alert when ann_rate >= this (must be > min_annualized_rate)
+  atm_range: 0.20             # filter strikes within ±20% of spot price
+  min_days_to_expiry: 1.0     # skip options with T below this (days); 0 = allow any positive T
+  # 监控列表；各所仅处理其支持的子集（见 README）：OKX/Deribit 币本位 = BTC+ETH；
+  # Binance 另支持 BNB SOL XRP DOGE；Deribit Linear 另支持 AVAX SOL TRX XRP
+  symbols:
+    - BTC
+    - ETH
+  stale_threshold_ms: 5000    # ignore order book snapshots older than 5s
+  signal_ui: classic          # classic = multi-line print; dashboard = top-like table (TTY only)
+  signal_dashboard_max_rows: 30
+  dashboard_quiet_exchanges: true   # dashboard only: less INFO from exchanges/okx_client on stderr (scrollback)
+  exit_days_before_expiry: 1         # auto-exit N days before option expiry
+  exit_target_profit_pct: 0.50       # auto-exit when floating profit >= 50%
+
+# Pairing summary: one file per exchange, overwritten each run; + periodic CSV of opportunities
+tracing:
+  pairing_log_dir: data/pairings
+  opportunity_csv_enabled: true
+  opportunity_csv_path: data/opportunities.csv
+  opportunity_csv_interval_sec: 5
+  sqlite_path: data/pcp_arbitrage.db   # SQLite for triplets + opportunity snapshots; empty string to disable
+
+# proxy: "http://127.0.0.1:7897"   # uncomment and set if Binance is geo-restricted
+
+# Web dashboard: HTML 机会表格 + 组合列表，通过浏览器访问。
+# 启动后打开 http://127.0.0.1:8765
+web_dashboard:
+  enabled: true
+  host: "0.0.0.0"     # 监听所有接口；仅本机访问可改为 127.0.0.1
+  port: 8765
+  width: 220           # 保留字段（内部用），HTML 模式下不影响显示
+
+logging:
+  level: INFO                              # global log level
+  tick_interval_sec: 0                     # Deribit: periodic DEBUG every N sec while WS runs (0 = off)
+  levels:
+    pcp_arbitrage.exchanges.binance: DEBUG  # per-module override
+
+telegram:
+  bot_token: ""    # BotFather token, e.g. "123456:ABC..."
+  chat_id: ""      # Your chat/group ID, e.g. "-1001234567890"

@@ -1,0 +1,1491 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8"/>
+<title>PCP Arbitrage Dashboard</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+
+  /* ── Theme variables ──────────────────────────────────────────────── */
+  :root {
+    --bg: #1e1e1e; --bg2: #141414; --bg3: #252526;
+    --border: #2d2d2d; --border2: #3c3c3c;
+    --text: #d4d4d4; --text-dim: #999; --text-muted: #555;
+    --accent: #007acc; --accent2: #4fc1ff;
+    --green: #4ec9b0; --red: #f48771; --yellow: #e5c07b;
+    --purple: #c586c0; --orange: #ce9178;
+    --strike-color: #dcdcaa; --expdate-color: #b5cea8;
+    --formula-op: #dcdcaa; --formula-leg: #9cdcfe;
+    --formula-border: #5a5a2a; --formula-title: #b5b54a;
+    --status-act: #6ee7c5; --status-ina: #c8c8c8;
+    --opp-pnl-trio-bg: rgba(0, 122, 204, 0.14);
+    --opp-pnl-trio-bg-hover: rgba(0, 122, 204, 0.22);
+  }
+  body.light {
+    --bg: #f5f5f5; --bg2: #e8e8e8; --bg3: #ececec;
+    --border: #d0d0d0; --border2: #c0c0c0;
+    --text: #1e1e1e; --text-dim: #555; --text-muted: #888;
+    --accent: #0066b8; --accent2: #0066b8;
+    --green: #1e7f5a; --red: #c0392b; --yellow: #8a6800;
+    --purple: #8b008b; --orange: #8b4513;
+    --strike-color: #5a4a00; --expdate-color: #3a6030;
+    --formula-op: #5a4a00; --formula-leg: #0044aa;
+    --formula-border: #b0a000; --formula-title: #7a7000;
+    --status-act: #0a5c40; --status-ina: #3d3d3d;
+    --opp-pnl-trio-bg: rgba(0, 102, 184, 0.10);
+    --opp-pnl-trio-bg-hover: rgba(0, 102, 184, 0.16);
+  }
+
+  body {
+    background: var(--bg); color: var(--text);
+    font-family: Menlo, Monaco, "Courier New", monospace;
+    display: flex; flex-direction: column; height: 100vh; overflow: hidden;
+    font-size: 12px;
+    transition: background 0.2s, color 0.2s;
+  }
+
+  /* ── Top info bar ─────────────────────────────────────────────────── */
+  #info-bar {
+    flex-shrink: 0; display: flex; align-items: center; gap: 20px;
+    background: var(--bg2); border-bottom: 1px solid var(--border);
+    padding: 5px 14px; min-height: 30px; overflow-x: auto; white-space: nowrap;
+  }
+  #info-bar .lbl { color: var(--text-muted); font-size: 11px; font-family: sans-serif; margin-right: 4px; }
+  .px-item { display: inline-flex; align-items: baseline; gap: 5px; }
+  .px-sep  { color: var(--border2); margin: 0 8px; font-size: 13px; }
+  .px-sym  { font-size: 11px; font-weight: 700; color: var(--accent2); }
+  .px-val  { font-size: 12px; font-weight: 700; color: var(--green); font-variant-numeric: tabular-nums; }
+  .px-val.up   { color: var(--green); }
+  .px-val.down { color: var(--red); }
+  .px-val.flash-up   { animation: flash-g 0.4s ease-out; }
+  .px-val.flash-down { animation: flash-r 0.4s ease-out; }
+  @keyframes flash-g { 0%{background:#4ec9b044} 100%{background:transparent} }
+  @keyframes flash-r { 0%{background:#f4877144} 100%{background:transparent} }
+  #info-uptime { color: var(--text-muted); font-size: 11px; font-family: sans-serif; }
+  #theme-btn {
+    margin-left: auto; padding: 2px 10px; border-radius: 3px;
+    background: var(--bg3); border: 1px solid var(--border2);
+    color: var(--text-dim); cursor: pointer; font-size: 11px;
+    font-family: sans-serif; flex-shrink: 0;
+  }
+  #theme-btn:hover { border-color: var(--accent); color: var(--text); }
+  #ws-status {
+    font-size: 10px; font-family: sans-serif; flex-shrink: 0;
+    padding: 1px 6px; border-radius: 2px;
+  }
+  #ws-status.ok   { color: var(--green); }
+  #ws-status.err  { color: var(--red); }
+
+  /* ── Tab bar ───────────────────────────────────────────────────────── */
+  #tab-bar {
+    flex-shrink: 0; display: flex;
+    background: var(--bg3); border-bottom: 1px solid var(--border2);
+  }
+  .tab {
+    padding: 7px 20px; cursor: pointer; font-size: 13px;
+    color: var(--text-muted); border-right: 1px solid var(--border2); user-select: none;
+    font-family: sans-serif;
+  }
+  .tab.active { color: var(--text); border-bottom: 2px solid var(--accent); background: var(--bg); }
+  .tab:hover:not(.active) { color: var(--text-dim); background: var(--bg2); }
+
+  /* ── Panels ────────────────────────────────────────────────────────── */
+  #panels { flex: 1; position: relative; overflow: hidden; }
+  .panel { position: absolute; inset: 0; display: none; flex-direction: column; overflow: hidden; }
+  .panel.active { display: flex; }
+
+  /* ── Shared table scroll area ─────────────────────────────────────── */
+  .tbl-scroll { flex: 1; overflow-y: auto; overflow-x: auto; }
+
+  /* ── Shared table styles ──────────────────────────────────────────── */
+  .data-table {
+    width: 100%; border-collapse: collapse; font-size: 12px;
+    font-family: Menlo, Monaco, "Courier New", monospace;
+  }
+  .data-table thead { position: sticky; top: 0; z-index: 10; }
+  .data-table th {
+    background: var(--bg3); color: var(--accent2); font-family: sans-serif;
+    font-weight: 600; padding: 5px 10px; text-align: left;
+    border-bottom: 2px solid var(--border2); white-space: nowrap;
+  }
+  .data-table th.r { text-align: right; }
+  .data-table th.c { text-align: center; }
+  .data-table td {
+    padding: 4px 10px; border-bottom: 1px solid var(--bg);
+    white-space: nowrap;
+  }
+  .data-table tr:hover td { background: var(--bg3); }
+  .data-table .r { text-align: right; }
+  .data-table .c { text-align: center; }
+
+  /* ── Opportunity table colours ────────────────────────────────────── */
+  .c-ex   { color: var(--accent2); font-weight: 600; }
+  .c-con  { color: var(--orange); }
+  .c-dir  { font-family: sans-serif; }
+  .c-fwd  { color: var(--accent2); }
+  .c-rev  { color: var(--yellow); }
+  .c-pos  { color: var(--green); }
+  .c-neg  { color: var(--red); }
+  .c-dim  { color: var(--text-dim); }
+  .c-ann  { color: var(--green); font-weight: 700; }
+  .c-max  { color: var(--accent2); }
+  .gross-formula {
+    display: block;
+    margin-top: 1px;
+    color: var(--text-muted);
+    font-size: 10px;
+    line-height: 1.2;
+    white-space: nowrap;
+  }
+  .c-act  {
+    color: var(--status-act); font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+    font-size: 13px; font-weight: 700; letter-spacing: 0.03em;
+  }
+  .c-ina  {
+    color: var(--status-ina); font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+    font-size: 13px; font-weight: 600; letter-spacing: 0.03em;
+  }
+  tr.inactive td { opacity: 0.55; }
+  tr.inactive td.col-status { opacity: 1; }
+  tr.has-signal td:first-child { border-left: 2px solid var(--accent); }
+
+  /* 机会表：净利 / 深度 / 预期最大收益 同背景（hover 时略加深，覆盖通用 tr:hover） */
+  #opp-table thead th.col-pnl-trio,
+  #opp-table tbody td.col-pnl-trio {
+    background: var(--opp-pnl-trio-bg);
+  }
+  #opp-table tbody tr:hover td.col-pnl-trio {
+    background: var(--opp-pnl-trio-bg-hover);
+  }
+
+  /* ── Overview panel ────────────────────────────────────────────────── */
+  #ex-tab-bar {
+    flex-shrink: 0; display: flex; flex-wrap: wrap;
+    background: var(--bg3); border-bottom: 1px solid var(--border2);
+    padding: 4px 8px; gap: 4px; min-height: 36px; align-items: center;
+  }
+  .ex-tab {
+    padding: 4px 14px; cursor: pointer; font-size: 12px; border-radius: 3px;
+    color: var(--text-muted); border: 1px solid transparent; user-select: none;
+    font-family: sans-serif;
+  }
+  .ex-tab.active { color: #fff; background: var(--accent); border-color: var(--accent); }
+  .ex-tab:hover:not(.active) { color: var(--text-dim); background: var(--bg2); border-color: var(--border2); }
+  #overview-scroll {
+    flex: 1; overflow-y: auto; padding: 16px 20px;
+    font-family: Menlo, Monaco, "Courier New", monospace; font-size: 12px;
+  }
+  .ex-pane { display: none; max-width: 960px; }
+  .ex-pane.active { display: block; }
+  .sym-block { margin-bottom: 24px; }
+  .sym-title { color: var(--text); font-weight: 700; font-size: 13px; margin-bottom: 2px; }
+  .sym-subtitle { color: var(--text-muted); font-size: 11px; margin-bottom: 6px; font-family: sans-serif; }
+  .sym-sep { color: var(--bg3); margin-bottom: 4px; }
+  .sym-header { color: var(--text-muted); margin-bottom: 3px; font-size: 11px; font-family: sans-serif; }
+  .exp-row { display: flex; margin-bottom: 2px; line-height: 1.7; }
+  .exp-date { width: 90px; flex-shrink: 0; color: var(--expdate-color); }
+  .exp-status { width: 70px; flex-shrink: 0; }
+  .exp-matched { color: var(--green); }
+  .exp-no-fut  { color: var(--text-muted); }
+  .exp-strikes { color: var(--strike-color); flex: 1; overflow: hidden; }
+  .exp-strikes .stk { margin-right: 10px; display: inline-block; white-space: nowrap; }
+  .exp-strikes .stk-atm { color: var(--red); font-weight: 700; }
+  .settle-badge {
+    display: inline-block; font-size: 10px; padding: 1px 6px; border-radius: 2px;
+    background: var(--bg3); color: var(--accent2); border: 1px solid var(--border2);
+    margin-left: 8px; vertical-align: middle; font-family: sans-serif;
+  }
+  #overview-empty { color: var(--text-muted); font-style: italic; padding: 24px; font-family: sans-serif; }
+
+  /* ── Status bar ────────────────────────────────────────────────────── */
+  #status-bar {
+    flex-shrink: 0; display: flex; align-items: center; gap: 16px; flex-wrap: wrap;
+    background: var(--bg2); border-top: 1px solid var(--border);
+    padding: 3px 14px; font-size: 11px; font-family: sans-serif; color: var(--text-muted);
+  }
+  .meta-stats-wrap {
+    display: flex; flex-direction: row; align-items: flex-start; gap: 12px;
+    flex-wrap: wrap;
+  }
+  .meta-panel-stats {
+    border: 1px solid var(--border2); border-radius: 3px; padding: 6px 10px;
+    display: inline-block; flex-shrink: 0; font-size: 11px; font-family: sans-serif;
+    align-self: stretch;
+  }
+  .meta-title-stats {
+    color: var(--text-dim); font-weight: 700; font-size: 11px; margin-bottom: 6px;
+    text-transform: uppercase; letter-spacing: 0.5px;
+  }
+  #opp-stats-bar table { border-collapse: collapse; }
+  #opp-stats-bar th {
+    text-align: left; color: var(--text-muted); padding: 2px 12px 2px 0;
+    font-weight: 400; white-space: nowrap;
+  }
+  #opp-stats-bar td {
+    text-align: right; padding: 2px 12px 2px 0; white-space: nowrap; min-width: 56px;
+  }
+  #opp-stats-bar td.s-cnt { color: var(--accent2); font-weight: 600; }
+  #opp-stats-bar td.s-pnl { color: var(--yellow); font-weight: 600; }
+  #opp-stats-bar .s-label { color: var(--text-dim); text-align: left; }
+  #opp-page-bar { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+  #opp-updated { margin-left: auto; }
+
+  /* 分页条（机会 / 历史共用样式） */
+  .page-bar {
+    display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+    font-family: sans-serif; font-size: 11px; color: var(--text-muted);
+  }
+  .page-bar .page-btns { display: inline-flex; gap: 4px; flex-wrap: wrap; }
+  .page-bar button {
+    padding: 2px 10px; border-radius: 3px;
+    background: var(--bg3); border: 1px solid var(--border2);
+    color: var(--text-dim); cursor: pointer; font-size: 11px; font-family: sans-serif;
+  }
+  .page-bar button:hover:not(:disabled) { border-color: var(--accent); color: var(--text); }
+  .page-bar button:disabled { opacity: 0.45; cursor: not-allowed; }
+
+  #history-bar.page-bar-host {
+    padding: 6px 14px; border-top: 1px solid var(--border);
+    background: var(--bg2); flex-shrink: 0;
+  }
+
+  /* ── 底部帮助文档（公式与手续费）────────────────────────────────────── */
+  #help-doc {
+    flex-shrink: 0;
+    border-top: 1px solid var(--border);
+    background: var(--bg2);
+    font-family: sans-serif;
+    font-size: 11px;
+    color: var(--text-dim);
+  }
+  #help-doc > summary {
+    list-style: none;
+    cursor: pointer;
+    padding: 8px 14px;
+    font-weight: 700;
+    font-size: 12px;
+    color: var(--accent2);
+    user-select: none;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+  #help-doc > summary::-webkit-details-marker { display: none; }
+  #help-doc > summary::before {
+    content: '▸';
+    font-size: 10px;
+    color: var(--text-muted);
+    width: 1em;
+  }
+  #help-doc[open] > summary::before { content: '▾'; }
+  #help-doc > summary:hover { color: var(--formula-title); }
+  .help-doc-badge {
+    font-size: 10px;
+    font-weight: 600;
+    color: var(--text-muted);
+    border: 1px solid var(--border2);
+    border-radius: 3px;
+    padding: 1px 6px;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+  }
+  .help-doc-body {
+    padding: 0 14px 14px;
+    max-height: min(42vh, 420px);
+    overflow-y: auto;
+    border-top: 1px solid var(--border);
+  }
+  .help-doc-grid {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 12px;
+    align-items: flex-start;
+    padding-top: 12px;
+  }
+  .help-doc-block {
+    border-radius: 3px;
+    padding: 10px 12px;
+    max-width: 520px;
+    flex: 1 1 280px;
+  }
+  .help-doc-block.formula {
+    border: 1px solid var(--formula-border);
+  }
+  .help-doc-block.fee {
+    border: 1px solid var(--border2);
+  }
+  .help-doc-block h3 {
+    font-size: 11px;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    margin: 0 0 8px;
+    font-family: sans-serif;
+  }
+  .help-doc-block.formula h3 { color: var(--formula-title); }
+  .help-doc-block.fee h3 { color: var(--text-dim); }
+  .help-doc-block .formula-line { margin-bottom: 4px; }
+  .help-doc-foot {
+    margin-top: 12px;
+    padding-top: 10px;
+    border-top: 1px solid var(--border);
+    font-size: 10px;
+    color: var(--text-muted);
+    line-height: 1.55;
+    max-width: 720px;
+  }
+
+  /* ── Meta bar (交易所信息 + 配置 + 今日统计) ─────────────────────────── */
+  #meta-bar {
+    flex-shrink: 0; background: var(--bg2); border-bottom: 1px solid var(--border);
+    padding: 8px 14px; font-family: sans-serif; font-size: 11px; color: var(--text-muted);
+  }
+  #meta-bar-inner { display: flex; gap: 12px; align-items: flex-start; flex-wrap: wrap; }
+  .meta-panel {
+    border: 1px solid var(--accent); border-radius: 3px; padding: 6px 10px; display: inline-block;
+  }
+  .meta-panel-cfg {
+    border: 1px solid var(--border2); border-radius: 3px; padding: 6px 10px; display: inline-block;
+  }
+  .meta-title { color: var(--accent); font-weight: 700; font-size: 11px; margin-bottom: 5px;
+    text-transform: uppercase; letter-spacing: 0.5px; }
+  .meta-title-cfg { color: var(--text-dim); font-weight: 700; font-size: 11px; margin-bottom: 6px;
+    text-transform: uppercase; letter-spacing: 0.5px; }
+  .meta-ex-table { border-collapse: collapse; font-size: 11px; }
+  .meta-ex-table th {
+    color: var(--text-muted); font-weight: 600; padding: 4px 12px 4px 0; text-align: left;
+    border-bottom: 1px solid var(--border); white-space: nowrap;
+  }
+  .meta-ex-table th.r { text-align: right; }
+  .meta-ex-table td { padding: 4px 12px 4px 0; white-space: nowrap; }
+  .meta-ex-table td.r { text-align: right; }
+  .meta-ex-table .total-row td { border-top: 1px solid var(--border); color: var(--text-muted); padding-top: 3px; }
+  .meta-ex { color: var(--accent2); font-weight: 600; }
+  .meta-settle { color: var(--purple); }
+  .meta-n { color: var(--accent2); }
+  .meta-rate { color: var(--text-muted); }
+  .meta-sym { color: var(--text-dim); }
+  .meta-cfg-row { display: flex; flex-direction: column; gap: 5px; }
+  .meta-cfg-item { display: flex; gap: 6px; align-items: baseline; }
+  .meta-cfg-item .lk { color: var(--text-dim); }
+  .meta-cfg-item .lv { color: var(--yellow); font-weight: 600; }
+  /* PCP formula */
+  .formula-line { margin-bottom: 3px; font-size: 11px; color: var(--text-dim); line-height: 1.6; }
+  .formula-line .fl { color: var(--formula-leg); }
+  .formula-line .fop { color: var(--formula-op); font-weight: 600; }
+  .formula-line .fdim { color: var(--text-muted); font-size: 10px; }
+  /* Toast notifications */
+  /* ── 手动下单按钮 ── */
+  .order-btn {
+    font-size: 11px; padding: 2px 8px; border-radius: 3px; border: none;
+    cursor: pointer; font-weight: 600; white-space: nowrap;
+  }
+  .order-btn-manual  { background: #2563eb; color: #fff; }
+  .order-btn-manual:hover { background: #1d4ed8; }
+  .order-btn-pending { background: #6b7280; color: #fff; cursor: not-allowed; }
+  .order-btn-auto    { background: #d97706; color: #fff; cursor: not-allowed; }
+  .order-btn-done    { background: #374151; color: #9ca3af; cursor: not-allowed; }
+  .toast {
+    background: #1a1a2e;
+    color: #e0e0e0;
+    border: 1px solid #f72585;
+    border-radius: 8px;
+    padding: 12px 16px;
+    font-size: 13px;
+    box-shadow: 0 4px 16px rgba(0,0,0,0.4);
+    animation: toast-in 0.3s ease-out;
+    cursor: pointer;
+  }
+  .toast:hover { opacity: 0.85; }
+  @keyframes toast-in {
+    from { opacity: 0; transform: translateX(40px); }
+    to   { opacity: 1; transform: translateX(0); }
+  }
+</style>
+</head>
+<body>
+
+<!-- Top info bar: index prices + clock + uptime + theme toggle -->
+<div id="info-bar">
+  <span class="lbl">指数价格</span>
+  <span id="px-area"><span style="color:#444;font-size:11px">等待数据…</span></span>
+  <span class="px-sep">|</span>
+  <span id="info-clock" style="color:var(--text-muted);font-size:11px;font-family:sans-serif"></span>
+  <span id="info-uptime" style="color:var(--text-muted);font-size:11px;font-family:sans-serif"></span>
+  <span id="ws-status" class="err">⬤ 连接中…</span>
+  <button id="theme-btn" onclick="toggleTheme()">☀️ 浅色</button>
+</div>
+
+<!-- Tab bar -->
+<div id="tab-bar">
+  <div class="tab active" data-panel="opp-panel">机会监控</div>
+  <div class="tab" data-panel="history-panel">历史机会</div>
+  <div class="tab" data-panel="positions-panel">持仓</div>
+  <div class="tab" data-panel="accounts-panel">账户</div>
+  <div class="tab" data-panel="overview-panel">PCP 组合</div>
+</div>
+
+<!-- Panels -->
+<div id="panels">
+
+  <!-- 机会监控 panel -->
+  <div class="panel active" id="opp-panel">
+    <div id="meta-bar"></div>
+    <div class="tbl-scroll">
+      <table class="data-table" id="opp-table">
+        <thead><tr>
+          <th>交易所</th>
+          <th>合约</th>
+          <th class="r">K</th>
+          <th class="r">距到期</th>
+          <th class="c">方向</th>
+          <th class="r">价差</th>
+          <th class="r">手续费</th>
+          <th class="r col-pnl-trio">净利</th>
+          <th class="r col-pnl-trio">深度</th>
+          <th class="r col-pnl-trio">预期最大收益</th>
+          <th class="r">年化</th>
+          <th class="r">历史最大年化 / 时长</th>
+          <th class="c">状态</th>
+          <th class="r">最后活跃时间</th>
+          <th class="c">操作</th>
+        </tr></thead>
+        <tbody id="opp-tbody">
+          <tr><td colspan="15" style="text-align:center;color:var(--text-muted);padding:24px;font-family:sans-serif">等待机会数据…</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <div id="status-bar">
+      <span id="opp-count"></span>
+      <span id="opp-page-bar" class="page-bar"></span>
+      <span id="opp-updated"></span>
+    </div>
+    <details id="help-doc">
+      <summary>
+        <span>帮助说明</span>
+        <span class="help-doc-badge">公式 · 手续费</span>
+      </summary>
+      <div class="help-doc-body">
+        <div class="help-doc-grid">
+          <div class="help-doc-block formula">
+            <h3>相关公式</h3>
+            <div class="formula-line"><span class="fl">正套（正向）</span>
+              <span class="fdim"> 买 Call + 卖 Put + 卖交割合约</span></div>
+            <div class="formula-line" style="margin-left:8px">
+              <span class="fop">价差 = put_bid + future_bid − call_ask − K</span></div>
+            <div class="formula-line" style="margin-top:6px"><span class="fl">反套（反向）</span>
+              <span class="fdim"> 卖 Call + 买 Put + 买交割合约</span></div>
+            <div class="formula-line" style="margin-left:8px">
+              <span class="fop">价差 = call_bid + K − put_ask − future_ask</span></div>
+            <div class="formula-line" style="margin-top:8px"><span class="fl">预期最大收益</span>
+              <span class="fop"> = 净利 × 深度 &nbsp;(USDT)</span></div>
+            <div class="formula-line" style="margin-left:8px;font-size:10px;color:var(--text-muted)">
+              深度 = 三腿对手盘最优档挂量之最小（与上表「深度」列一致）</div>
+            <div class="formula-line" style="margin-top:6px"><span class="fl">年化</span>
+              <span class="fop"> = (价差 − 6腿手续费) / 保证金 × (365 / 到期天数)</span></div>
+            <div class="formula-line" style="margin-left:8px;font-size:10px;color:var(--text-muted)">
+              K = 行权价 &nbsp;|&nbsp; 金额均换算为 USDT</div>
+          </div>
+          <div class="help-doc-block fee">
+            <h3>手续费公式</h3>
+            <div class="formula-line"><span class="fl">机会表「手续费」列</span>
+              <span class="fop"> = 2 × (C + P + F)</span></div>
+            <div class="formula-line" style="margin-left:8px">
+              <span class="fop">C = min(张数 × 指数价 × 期权 taker 费率, 7% × 期权价格 × 张数)</span></div>
+            <div class="formula-line" style="margin-left:8px">
+              <span class="fop">P = min(张数 × 指数价 × 期权 taker 费率, 7% × 期权价格 × 张数)</span></div>
+            <div class="formula-line" style="margin-left:8px">
+              <span class="fop">F = 期货价格 × 张数 × 期货 taker 费率</span></div>
+            <div class="formula-line" style="margin-left:8px;font-size:10px;color:var(--text-muted)">
+              其中 2 表示开仓 + 平仓两次手续费；C/P/F 对应 Call/Put/Future 单边手续费</div>
+            <div class="formula-line" style="margin-left:8px;margin-top:6px;font-size:10px;color:var(--text-muted)">
+              说明：式中「7%」为 OKX 期权手续费封顶系数；Binance、Deribit 等所规则或比例可能不同，以各交易所官方说明为准。</div>
+          </div>
+        </div>
+        <p class="help-doc-foot">
+          本页数值与上表列含义一致；费率以顶部「交易所信息」中展示的 taker 费率为准。展开本区块即可查阅，默认折叠以减少占用主表区域。
+        </p>
+      </div>
+    </details>
+  </div>
+
+  <div class="panel" id="history-panel">
+    <div class="tbl-scroll">
+      <table class="data-table" id="history-table">
+        <thead><tr>
+          <th class="r">开始时间</th>
+          <th class="r">结束时间</th>
+          <th class="r">持续时间(ms)</th>
+          <th>交易所</th>
+          <th>合约</th>
+          <th class="c">方向</th>
+          <th class="r">距到期</th>
+          <th class="r">价差</th>
+          <th class="r">手续费</th>
+          <th class="r">净利</th>
+          <th class="r">深度</th>
+          <th class="r">年化%</th>
+        </tr></thead>
+        <tbody id="history-tbody">
+          <tr><td colspan="12" style="text-align:center;color:var(--text-muted);padding:24px;font-family:sans-serif">切换到此标签加载历史…</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <div id="history-bar" class="page-bar page-bar-host"></div>
+  </div>
+
+  <!-- 持仓 panel -->
+  <div class="panel" id="positions-panel">
+    <div class="tbl-scroll">
+      <table class="data-table" id="positions-table">
+        <thead><tr>
+          <th class="r">ID</th>
+          <th>交易所</th>
+          <th>标的</th>
+          <th>到期日</th>
+          <th class="r">行权价</th>
+          <th class="c">方向</th>
+          <th class="r">当前标记价格</th>
+          <th>开仓时间</th>
+          <th class="c">状态</th>
+        </tr></thead>
+        <tbody id="positions-tbody">
+          <tr><td colspan="9" style="text-align:center;color:var(--text-muted);padding:24px;font-family:sans-serif">无持仓数据</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+
+  <!-- 账户 panel -->
+  <div class="panel" id="accounts-panel">
+    <div class="tbl-scroll">
+      <table class="data-table" id="accounts-table">
+        <thead><tr>
+          <th>交易所</th>
+          <th class="r">总权益 (USDT)</th>
+          <th class="r">可用保证金 (USDT)</th>
+          <th class="r">IM%</th>
+          <th class="r">MM%</th>
+          <th class="c">套利开关</th>
+        </tr></thead>
+        <tbody id="accounts-tbody">
+          <tr><td colspan="6" style="text-align:center;color:var(--text-muted);padding:24px;font-family:sans-serif">无账户数据</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+
+  <!-- PCP 组合 panel -->
+  <div class="panel" id="overview-panel">
+    <div id="ex-tab-bar">
+      <span style="color:var(--text-muted);font-size:11px;font-family:sans-serif">等待数据…</span>
+    </div>
+    <div id="overview-scroll">
+      <div id="overview-empty">等待组合摘要数据…</div>
+    </div>
+  </div>
+
+</div>
+
+<script>
+// ── Theme ────────────────────────────────────────────────────────────────────
+let _themeOverride = localStorage.getItem('theme');  // null = auto, 'dark', 'light'
+
+function applyTheme(mode) {
+  document.body.classList.toggle('light', mode === 'light');
+  document.getElementById('theme-btn').textContent = mode === 'light' ? '🌙 深色' : '☀️ 浅色';
+}
+function autoTheme() {
+  const h = new Date().getHours();
+  return (h >= 20 || h < 8) ? 'dark' : 'light';
+}
+function toggleTheme() {
+  const cur = document.body.classList.contains('light') ? 'light' : 'dark';
+  _themeOverride = cur === 'light' ? 'dark' : 'light';
+  localStorage.setItem('theme', _themeOverride);
+  applyTheme(_themeOverride);
+}
+// Auto-theme on load, check every minute
+function checkAutoTheme() {
+  if (_themeOverride === null) applyTheme(autoTheme());
+}
+// Apply saved or auto theme immediately
+applyTheme(_themeOverride !== null ? _themeOverride : autoTheme());
+setInterval(checkAutoTheme, 60000);
+
+// ── Tabs ────────────────────────────────────────────────────────────────────
+document.querySelectorAll('.tab').forEach(tab => {
+  tab.addEventListener('click', () => {
+    document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+    document.querySelectorAll('.panel').forEach(p => p.classList.remove('active'));
+    tab.classList.add('active');
+    document.getElementById(tab.dataset.panel).classList.add('active');
+    if (tab.dataset.panel === 'overview-panel') loadOverview();
+    if (tab.dataset.panel === 'history-panel') loadHistory();
+    if (tab.dataset.panel === 'positions-panel') renderPositions();
+  });
+});
+
+// ── Helpers ──────────────────────────────────────────────────────────────────
+function escHtml(s) {
+  return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+}
+function fmtNum(v, dec) {
+  if (v == null) return '<span class="c-dim">—</span>';
+  return v.toFixed(dec);
+}
+function fmtPrice(px, sym) {
+  if (px == null) return '';
+  const hi = ['DOGE','TRX','SHIB','PEPE'];
+  if (hi.includes((sym||'').toUpperCase())) return px.toFixed(4);
+  if (px >= 1000) return px.toLocaleString('en-US', {minimumFractionDigits:2,maximumFractionDigits:2});
+  return px.toFixed(4);
+}
+function fmtStrike(v) {
+  if (v >= 1000) return v.toLocaleString('en-US', {maximumFractionDigits:0});
+  return String(v);
+}
+/** 秒（含小数）→ 总毫秒，用于机会/历史「持续」列。 */
+function fmtDuration(sec) {
+  if (sec == null || sec === '') return '—';
+  const n = Number(sec);
+  if (!Number.isFinite(n) || n < 0) return '—';
+  return Math.round(n * 1000) + 'ms';
+}
+function fmtDte(days) {
+  if (days == null || days <= 0) return '<span class="c-dim">—</span>';
+  if (days < 1) return Math.round(days * 24) + 'h';
+  return days.toFixed(1) + '天';
+}
+function fmtVal(v) {
+  if (v == null) return '—';
+  const n = Number(v);
+  if (!Number.isFinite(n)) return '—';
+  return n.toFixed(2);
+}
+function fmtFeeWithFormula(r) {
+  return fmtNum(r.fee, 2);
+}
+function fmtGrossWithFormula(r) {
+  const gross = fmtNum(r.gross, 2);
+  const callPx = r.call_px_usdt;
+  const putPx = r.put_px_usdt;
+  const futPx = r.fut_px_usdt;
+  const k = r.strike;
+  const hasAll = [callPx, putPx, futPx, k].every(v => Number.isFinite(Number(v)));
+  if (!hasAll) return gross;
+  const formula = (r.direction === '正向')
+    ? (fmtVal(putPx) + ' + ' + fmtVal(futPx) + ' - ' + fmtVal(callPx) + ' - ' + fmtVal(k))
+    : (fmtVal(callPx) + ' + ' + fmtVal(k) + ' - ' + fmtVal(putPx) + ' - ' + fmtVal(futPx));
+  return gross + '<span class="gross-formula">= ' + formula + '</span>';
+}
+/** 仅展示年化百分比（机会监控「年化」列）。 */
+function fmtAnnPctOnly(pct) {
+  if (pct == null || !Number.isFinite(Number(pct))) return '<span class="c-dim">—</span>';
+  return Number(pct).toFixed(2) + '%';
+}
+/** 历史表中该组合年化最高的一条的「年化 / 时长」。 */
+function fmtHistPeakAnnWithDur(hAnn, hDurSec) {
+  if (hAnn == null || !Number.isFinite(Number(hAnn))) return '<span class="c-dim">—</span>';
+  let d = '—';
+  if (hDurSec != null) {
+    const n = Number(hDurSec);
+    if (Number.isFinite(n) && n >= 0) d = fmtDuration(n);
+  }
+  return Number(hAnn).toFixed(2) + '% / ' + d;
+}
+/** Unix 秒时间戳（含小数）→ 本地时间（到秒）。 */
+function fmtUnixSecLocal(sec) {
+  if (sec == null) return '<span class="c-dim">—</span>';
+  const n = Number(sec);
+  if (!Number.isFinite(n) || n <= 0) return '<span class="c-dim">—</span>';
+  try {
+    return new Date(n * 1000).toLocaleString('zh-CN', {
+      year: '2-digit',
+      month: '2-digit',
+      day: '2-digit',
+      hour: '2-digit',
+      minute: '2-digit',
+      second: '2-digit',
+      hour12: false,
+    });
+  } catch {
+    return '<span class="c-dim">—</span>';
+  }
+}
+/** DB/API 为 UTC ISO；按浏览器本地时区展示（含毫秒）。 */
+function fmtUtcIsoToLocal(s) {
+  if (!s) return '—';
+  try {
+    let iso = String(s).trim();
+    if (!iso.includes('T')) return escHtml(s);
+    if (!/[Zz]|[+-]\\d{2}:?\\d{2}$/.test(iso)) iso = iso + 'Z';
+    const d = new Date(iso);
+    if (Number.isNaN(d.getTime())) return escHtml(s);
+    const txt = d.toLocaleString('zh-CN', {
+      year: 'numeric',
+      month: '2-digit',
+      day: '2-digit',
+      hour: '2-digit',
+      minute: '2-digit',
+      second: '2-digit',
+      fractionalSecondDigits: 3,
+      hour12: false,
+      timeZoneName: 'short',
+    });
+    return escHtml(txt);
+  } catch {
+    return escHtml(s);
+  }
+}
+function parseIsoUnixSec(s) {
+  if (!s) return null;
+  let iso = String(s).trim();
+  if (!iso.includes('T')) return null;
+  if (!/[Zz]|[+-]\\d{2}:?\\d{2}$/.test(iso)) iso = iso + 'Z';
+  const t = Date.parse(iso);
+  if (Number.isNaN(t)) return null;
+  return t / 1000;
+}
+
+// ── 分页（每页条数固定为 100）─────────────────────────────────────────────────
+const PAGE_SIZE = 100;
+let _oppPage = 0;
+let _historyPage = 0;
+
+// ── 手动下单 ──────────────────────────────────────────────────────────────────
+// 记录正在下单中的 key，防止重复点击
+const _orderingKeys = new Set();
+
+/** 生成下单按钮 HTML。
+ *  - active + OKX + 无持仓 + ann_pct < order_min_ann：显示"下单"按钮
+ *  - active + has_position：显示"已持仓"（disabled）
+ *  - active + ann_pct >= order_min_ann：显示"下单中"（disabled，自动下单触发）
+ *  - 其他：空
+ */
+function fmtOrderBtn(r) {
+  if (!r.active) return '';
+  if (r.exchange.toLowerCase() !== 'okx') return '';
+  const key = r.exchange + '\0' + r.label + '\0' + r.direction;
+  if (r.has_position) {
+    return '<button class="order-btn order-btn-done" disabled>已持仓</button>';
+  }
+  const orderMinAnn = (_lastMeta && _lastMeta.order_min_ann != null) ? _lastMeta.order_min_ann * 100 : null;
+  if (orderMinAnn != null && r.ann_pct >= orderMinAnn) {
+    return '<button class="order-btn order-btn-auto" disabled>下单中</button>';
+  }
+  if (_orderingKeys.has(key)) {
+    return '<button class="order-btn order-btn-pending" disabled>下单中…</button>';
+  }
+  return '<button class="order-btn order-btn-manual" onclick="submitManualOrder(' +
+    JSON.stringify(r.exchange) + ',' +
+    JSON.stringify(r.label) + ',' +
+    JSON.stringify(r.direction) +
+    ')">下单</button>';
+}
+
+async function submitManualOrder(exchange, label, direction) {
+  const key = exchange + '\0' + label + '\0' + direction;
+  if (_orderingKeys.has(key)) return;
+  _orderingKeys.add(key);
+  // Re-render table to immediately show "下单中…" state
+  if (_cachedOppRows !== null) renderOppTable();
+  try {
+    const resp = await fetch('/api/manual-entry', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({exchange, label, direction}),
+    });
+    const data = await resp.json();
+    if (!resp.ok || !data.ok) {
+      alert('下单失败：' + (data.error || resp.status));
+      _orderingKeys.delete(key);
+    }
+    // On success keep key in _orderingKeys; has_position will update via WS broadcast
+  } catch (e) {
+    alert('下单请求异常：' + e);
+    _orderingKeys.delete(key);
+  }
+  if (_cachedOppRows !== null) renderOppTable();
+}
+
+
+
+function _sortOppRows(source) {
+  return source.slice().sort((a, b) => {
+    if (a.active !== b.active) return b.active - a.active;
+    return b.ann_pct - a.ann_pct;
+  });
+}
+
+function _paginationButtons(prefix, disabledFirstPrev, disabledNextLast) {
+  const d0 = disabledFirstPrev ? ' disabled' : '';
+  const d1 = disabledNextLast ? ' disabled' : '';
+  return (
+    '<span class="page-btns">' +
+    '<button type="button" data-' + prefix + '="first"' + d0 + '>首页</button>' +
+    '<button type="button" data-' + prefix + '="prev"' + d0 + '>上一页</button>' +
+    '<button type="button" data-' + prefix + '="next"' + d1 + '>下一页</button>' +
+    '<button type="button" data-' + prefix + '="last"' + d1 + '>尾页</button>' +
+    '</span>'
+  );
+}
+
+// ── Index price bar ───────────────────────────────────────────────────────────
+const prevPrices = {};
+let priceSymOrder = [];
+
+function initPriceBar(symbols) {
+  const area = document.getElementById('px-area');
+  // clear placeholder on first call
+  if (area.querySelector('span[style]')) area.innerHTML = '';
+  const existing = new Set([...area.querySelectorAll('.px-item')].map(el => el.dataset.sym));
+  for (const sym of symbols) {
+    if (existing.has(sym)) continue;
+    if (area.querySelector('.px-item')) {
+      const sep = document.createElement('span');
+      sep.className = 'px-sep';
+      sep.textContent = '|';
+      area.appendChild(sep);
+    }
+    const item = document.createElement('span');
+    item.className = 'px-item';
+    item.dataset.sym = sym;
+    item.innerHTML = '<span class="px-sym">' + escHtml(sym) + '</span>' +
+      '<span class="px-val" id="pxv-' + sym + '">—</span>';
+    area.appendChild(item);
+  }
+  priceSymOrder = symbols;
+}
+
+function updatePriceBar(prices) {
+  if (!prices) return;
+  const syms = priceSymOrder.length ? priceSymOrder : Object.keys(prices);
+  for (const sym of syms) {
+    const px = prices[sym];
+    if (px == null) continue;
+    let el = document.getElementById('pxv-' + sym);
+    if (!el) {
+      const area = document.getElementById('px-area');
+      if (area.querySelector('span[style]')) area.innerHTML = '';
+      const item = document.createElement('span');
+      item.className = 'px-item';
+      item.dataset.sym = sym;
+      item.innerHTML = '<span class="px-sym">' + escHtml(sym) + '</span>' +
+        '<span class="px-val" id="pxv-' + sym + '">—</span>';
+      area.appendChild(item);
+      el = document.getElementById('pxv-' + sym);
+    }
+    const prev = prevPrices[sym];
+    const hi = ['DOGE','TRX','SHIB','PEPE'];
+    const fmt = hi.includes(sym.toUpperCase())
+      ? px.toFixed(4)
+      : (px >= 1000 ? px.toLocaleString('en-US',{minimumFractionDigits:2,maximumFractionDigits:2}) : px.toFixed(4));
+    el.textContent = fmt;
+    if (prev !== undefined) {
+      el.classList.remove('up','down','flash-up','flash-down');
+      void el.offsetWidth;
+      if (px > prev) el.classList.add('up','flash-up');
+      else if (px < prev) el.classList.add('down','flash-down');
+    }
+    prevPrices[sym] = px;
+  }
+}
+
+// ── Opportunity table ─────────────────────────────────────────────────────────
+let serverStartTs = null;
+let _cachedOppRows = null;
+
+let _lastMeta = null;
+function renderMetaBar(meta) {
+  if (!meta) return;
+  _lastMeta = meta;
+  _updateMetaBar();
+}
+function _updateMetaBar() {
+  if (!_lastMeta) return;
+  const meta = _lastMeta;
+  const bar = document.getElementById('meta-bar');
+  const ann = (meta.min_ann * 100).toFixed(2);
+  const atm = (meta.atm_range * 100).toFixed(0);
+  const dte = meta.min_dte.toFixed(1);
+  const orderAnn = meta.order_min_ann != null ? (meta.order_min_ann * 100).toFixed(2) + '%' : '—';
+  const exitProfit = meta.exit_target_profit_pct != null ? (meta.exit_target_profit_pct * 100).toFixed(0) + '%' : '—';
+  let exRows = '';
+  let totalT = 0;
+  if (meta.exchanges && meta.exchanges.length) {
+    totalT = meta.exchanges.reduce((s, e) => s + e.n_triplets, 0);
+    for (const ex of meta.exchanges) {
+      exRows += '<tr>' +
+        '<td class="meta-ex">' + escHtml(ex.name) + '</td>' +
+        '<td class="meta-settle">' + escHtml(ex.settle_type) + '</td>' +
+        '<td class="r meta-rate">' + (ex.option_taker_rate * 100).toFixed(4) + '%</td>' +
+        '<td class="r meta-rate">' + (ex.option_maker_rate * 100).toFixed(4) + '%</td>' +
+        '<td class="r meta-rate">' + (ex.future_taker_rate * 100).toFixed(4) + '%</td>' +
+        '<td class="r meta-rate">' + (ex.future_maker_rate * 100).toFixed(4) + '%</td>' +
+        '<td class="meta-sym">' + escHtml((ex.symbols||[]).join(', ')) + '</td>' +
+        '<td class="r meta-n">' + ex.n_triplets + '</td></tr>';
+    }
+    exRows += '<tr class="total-row"><td colspan="7">合计</td>' +
+      '<td class="r meta-n">' + totalT + '</td></tr>';
+  }
+
+  bar.innerHTML =
+    '<div id="meta-bar-inner">' +
+      // 交易所信息 panel (blue border)
+      '<div class="meta-panel">' +
+        '<div class="meta-title">交易所信息</div>' +
+        (exRows ? '<table class="meta-ex-table"><thead><tr>' +
+          '<th>交易所</th><th>结算类型</th><th class="r">期权 taker</th><th class="r">期权 maker</th><th class="r">交割合约 taker</th><th class="r">交割合约 maker</th>' +
+          '<th>监控标的</th><th class="r">组合数</th>' +
+          '</tr></thead><tbody>' + exRows + '</tbody></table>' :
+          '<div style="color:var(--text-muted);font-style:italic">交易所初始化中…</div>') +
+      '</div>' +
+      // 配置信息 panel (grey border)
+      '<div class="meta-panel-cfg">' +
+        '<div class="meta-title-cfg">配置信息</div>' +
+        '<div class="meta-cfg-row">' +
+          '<div class="meta-cfg-item"><span class="lk">通知阈值</span><span class="lv">≥ ' + ann + '%</span></div>' +
+          '<div class="meta-cfg-item"><span class="lk">下单阈值</span><span class="lv">' + orderAnn + '</span></div>' +
+          '<div class="meta-cfg-item"><span class="lk">止盈目标</span><span class="lv">' + exitProfit + '</span></div>' +
+          '<div class="meta-cfg-item"><span class="lk">ATM 范围</span><span class="lv">±' + atm + '%</span></div>' +
+          '<div class="meta-cfg-item"><span class="lk">最短到期</span><span class="lv">' + dte + ' 天</span></div>' +
+        '</div>' +
+      '</div>' +
+      '<div class="meta-stats-wrap">' +
+        '<div class="meta-panel-stats">' +
+          '<div class="meta-title-stats">今日机会统计</div>' +
+          '<div id="opp-stats-bar"></div>' +
+        '</div>' +
+      '</div>' +
+    '</div>';
+  if (_cachedOppRows !== null) _renderOppStats(_cachedOppRows);
+  else _renderOppStats([]);
+}
+
+function renderOppTable(rows) {
+  if (rows !== undefined) _cachedOppRows = rows;
+  if (_cachedOppRows === null) return;
+  const source = _cachedOppRows;
+  const sorted = _sortOppRows(source);
+  const pgBar = document.getElementById('opp-page-bar');
+
+  if (sorted.length === 0) {
+    document.getElementById('opp-tbody').innerHTML =
+      '<tr><td colspan="15" style="text-align:center;color:var(--text-muted);padding:24px;font-family:sans-serif">暂无机会</td></tr>';
+    document.getElementById('opp-count').textContent = '';
+    if (pgBar) pgBar.innerHTML = '';
+    _oppPage = 0;
+    return;
+  }
+
+  const total = sorted.length;
+  const totalPages = Math.max(1, Math.ceil(total / PAGE_SIZE));
+  if (_oppPage >= totalPages) _oppPage = totalPages - 1;
+  if (_oppPage < 0) _oppPage = 0;
+  const start = _oppPage * PAGE_SIZE;
+  const slice = sorted.slice(start, start + PAGE_SIZE);
+  const fromN = start + 1;
+  const toN = Math.min(start + slice.length, total);
+
+  if (pgBar) {
+    const firstPrev = _oppPage <= 0;
+    const nextLast = _oppPage >= totalPages - 1;
+    pgBar.innerHTML =
+      '<span class="page-info">共 ' + total + ' 条，每页 ' + PAGE_SIZE + ' 条，第 ' + fromN + '–' + toN + ' 条 · 第 ' +
+      (_oppPage + 1) + ' / ' + totalPages + ' 页</span>' +
+      _paginationButtons('opage', firstPrev, nextLast);
+  }
+
+  let html = '';
+  for (const r of slice) {
+    const hasSig = r.active;
+    const rowCls = (hasSig ? 'has-signal' : '') + (r.active ? '' : ' inactive');
+    const dirCls = r.direction === '正向' ? 'c-fwd' : 'c-rev';
+    const netCls = r.net >= 0 ? 'c-pos' : 'c-neg';
+    const stCls  = r.active ? 'c-act' : 'c-ina';
+    const stTxt  = r.active ? '✅ active' : '⏸️ inactive';
+    const expMax = r.expected_max != null ? fmtNum(r.expected_max, 2) : '—';
+    const expMaxCls = r.expected_max != null && r.expected_max >= 0 ? 'c-pos' : 'c-neg';
+
+    html += '<tr class="' + rowCls + '">' +
+      '<td class="c-ex">' + escHtml(r.exchange) + '</td>' +
+      '<td class="c-con">' + escHtml(r.label) + '</td>' +
+      '<td class="r c-dim">' + fmtStrike(r.strike) + '</td>' +
+      '<td class="r c-dim">' + fmtDte(r.days_to_expiry) + '</td>' +
+      '<td class="c ' + dirCls + '">' + escHtml(r.direction) + '</td>' +
+      '<td class="r">' + fmtGrossWithFormula(r) + '</td>' +
+      '<td class="r c-dim">' + fmtFeeWithFormula(r) + '</td>' +
+      '<td class="r col-pnl-trio ' + netCls + '">' + fmtNum(r.net, 2) + '</td>' +
+      '<td class="r col-pnl-trio c-dim">' + (r.tradeable != null ? Number(r.tradeable).toPrecision(4) : '—') + '</td>' +
+      '<td class="r col-pnl-trio ' + expMaxCls + '">' + expMax + '</td>' +
+      '<td class="r c-ann">' + fmtAnnPctOnly(r.ann_pct) + '</td>' +
+      '<td class="r c-max">' + fmtHistPeakAnnWithDur(r.hist_ann_pct, r.hist_duration_sec) + '</td>' +
+      '<td class="c col-status ' + stCls + '">' + stTxt + '</td>' +
+      '<td class="r c-dim">' + fmtUnixSecLocal(r.last_active_eval) + '</td>' +
+      '<td class="c">' + fmtOrderBtn(r) + '</td>' +
+      '</tr>';
+  }
+  document.getElementById('opp-tbody').innerHTML = html;
+  const act = sorted.filter(r => r.active).length;
+  document.getElementById('opp-count').textContent =
+    act + ' 个 active / ' + total + ' 个合计';
+  const now = new Date().toLocaleTimeString('zh-CN',{hour12:false});
+  document.getElementById('opp-updated').textContent = '更新于 ' + now;
+  _renderOppStats(source);
+}
+
+function _renderOppStats(rows) {
+  const bar = document.getElementById('opp-stats-bar');
+  if (!bar) return;
+  const todayStr = new Date().toLocaleDateString('zh-CN', {year:'numeric',month:'2-digit',day:'2-digit'});
+  // Use all rows (today = last_active_eval within today, or active rows)
+  // "今日" = row has been active today (last_active_eval timestamp is today)
+  function isToday(r) {
+    const ts = r.last_active_eval || r.first_active;
+    if (!ts) return r.active;
+    const d = new Date(ts * 1000);
+    return d.toLocaleDateString('zh-CN', {year:'numeric',month:'2-digit',day:'2-digit'}) === todayStr;
+  }
+  const todayRows = rows.filter(isToday);
+  const fwdRows = todayRows.filter(r => r.direction === '正向');
+  const revRows = todayRows.filter(r => r.direction === '反向');
+  function sumMax(rs) {
+    return rs.reduce((s, r) => s + (r.expected_max != null ? r.expected_max : 0), 0);
+  }
+  const fmtC = n => n.toString();
+  const fmtP = n => fmtNum(n, 2);
+  bar.innerHTML =
+    '<table><thead><tr>' +
+      '<th></th><th>机会个数</th><th>预期最大收益 (USDT)</th>' +
+    '</tr></thead><tbody>' +
+      '<tr><td class="s-label">今日正向机会</td>' +
+        '<td class="s-cnt">' + fmtC(fwdRows.length) + '</td>' +
+        '<td class="s-pnl">' + fmtP(sumMax(fwdRows)) + '</td></tr>' +
+      '<tr><td class="s-label">今日反向机会</td>' +
+        '<td class="s-cnt">' + fmtC(revRows.length) + '</td>' +
+        '<td class="s-pnl">' + fmtP(sumMax(revRows)) + '</td></tr>' +
+      '<tr><td class="s-label">今日机会</td>' +
+        '<td class="s-cnt">' + fmtC(todayRows.length) + '</td>' +
+        '<td class="s-pnl">' + fmtP(sumMax(todayRows)) + '</td></tr>' +
+    '</tbody></table>';
+}
+
+setInterval(() => {
+  const p = document.getElementById('opp-panel');
+  if (p && p.classList.contains('active') && _cachedOppRows !== null)
+    renderOppTable(undefined);
+}, 1000);
+
+// ── History (open + closed sessions) ──────────────────────────────────────────
+let _historySessionsCache = null;
+
+function _renderHistoryRows() {
+  const tb = document.getElementById('history-tbody');
+  const bar = document.getElementById('history-bar');
+  const sessions = _historySessionsCache;
+  if (!sessions || !sessions.length) return;
+  const total = sessions.length;
+  const totalPages = Math.max(1, Math.ceil(total / PAGE_SIZE));
+  if (_historyPage >= totalPages) _historyPage = totalPages - 1;
+  if (_historyPage < 0) _historyPage = 0;
+  const start = _historyPage * PAGE_SIZE;
+  const pageSlice = sessions.slice(start, start + PAGE_SIZE);
+  const fromN = start + 1;
+  const toN = Math.min(start + pageSlice.length, total);
+
+  const nowSec = Date.now() / 1000;
+  let nOpen = 0;
+  for (const h of sessions) {
+    const open = (h.ended_utc == null || h.ended_utc === '');
+    if (open) nOpen++;
+  }
+
+  let html = '';
+  for (const h of pageSlice) {
+    const open = (h.ended_utc == null || h.ended_utc === '');
+    const dirCls = h.direction === '正向' ? 'c-fwd' : 'c-rev';
+    const netCls = (h.net_usdt != null && h.net_usdt >= 0) ? 'c-pos' : 'c-neg';
+    let durSec = h.duration_sec;
+    if (open) {
+      const t0 = parseIsoUnixSec(h.started_utc);
+      if (t0 != null) durSec = nowSec - t0;
+    }
+    const endCell = open
+      ? '<span class="c-dim">—</span>'
+      : fmtUtcIsoToLocal(h.ended_utc);
+    const trCls = open ? 'has-signal' : 'inactive';
+    html += '<tr class="' + trCls + '">' +
+      '<td class="r c-dim">' + fmtUtcIsoToLocal(h.started_utc) + '</td>' +
+      '<td class="r c-dim">' + endCell + '</td>' +
+      '<td class="r c-dim">' + fmtDuration(durSec) + '</td>' +
+      '<td class="c-ex">' + escHtml(h.exchange != null ? h.exchange : '') + '</td>' +
+      '<td class="c-con">' + escHtml(h.contract != null ? h.contract : '') + '</td>' +
+      '<td class="c ' + dirCls + '">' + escHtml(h.direction != null ? h.direction : '') + '</td>' +
+      '<td class="r c-dim">' + (h.days_to_exp != null ? fmtDte(h.days_to_exp) : '—') + '</td>' +
+      '<td class="r">' + (h.gross_usdt != null ? h.gross_usdt.toFixed(2) : '—') + '</td>' +
+      '<td class="r c-dim">' + (h.fee_usdt != null ? h.fee_usdt.toFixed(2) : '—') + '</td>' +
+      '<td class="r ' + netCls + '">' + (h.net_usdt != null ? h.net_usdt.toFixed(2) : '—') + '</td>' +
+      '<td class="r c-dim">' + (h.tradeable != null ? Number(h.tradeable).toPrecision(4) : '—') + '</td>' +
+      '<td class="r c-ann">' + (h.ann_pct != null ? h.ann_pct.toFixed(2) + '%' : '—') + '</td>' +
+      '</tr>';
+  }
+  tb.innerHTML = html;
+
+  const firstPrev = _historyPage <= 0;
+  const nextLast = _historyPage >= totalPages - 1;
+  const openNote = nOpen ? '（进行中 ' + nOpen + '）' : '';
+  bar.innerHTML =
+    '<span class="page-info">共 ' + total + ' 条' + openNote +
+    '，每页 ' + PAGE_SIZE + ' 条，本页第 ' + fromN + '–' + toN + ' 条 · 第 ' +
+    (_historyPage + 1) + ' / ' + totalPages + ' 页。未结束行按开始时间、已结束行按结束时间倒序</span>' +
+    _paginationButtons('hpage', firstPrev, nextLast);
+}
+
+function loadHistory() {
+  const tb = document.getElementById('history-tbody');
+  const bar = document.getElementById('history-bar');
+  tb.innerHTML = '<tr><td colspan="12" style="text-align:center;color:var(--text-muted);padding:16px;font-family:sans-serif">加载中…</td></tr>';
+  fetch('/api/opportunity-history?limit=500')
+    .then(r => r.json())
+    .then(data => {
+      const sessions = data.sessions || [];
+      if (data.error && !sessions.length) {
+        tb.innerHTML = '<tr><td colspan="12" style="text-align:center;color:var(--text-muted);padding:16px;font-family:sans-serif">' +
+          escHtml(data.error) + '</td></tr>';
+        bar.innerHTML = '';
+        _historySessionsCache = null;
+        _historyPage = 0;
+        return;
+      }
+      if (sessions.length === 0) {
+        tb.innerHTML = '<tr><td colspan="12" style="text-align:center;color:var(--text-muted);padding:16px;font-family:sans-serif">暂无记录</td></tr>';
+        bar.innerHTML = '';
+        _historySessionsCache = null;
+        _historyPage = 0;
+        return;
+      }
+      _historySessionsCache = sessions;
+      _renderHistoryRows();
+    })
+    .catch(err => {
+      tb.innerHTML = '<tr><td colspan="12" style="text-align:center;color:var(--red);padding:16px;font-family:sans-serif">加载失败</td></tr>';
+      bar.innerHTML = escHtml(String(err));
+      _historySessionsCache = null;
+      _historyPage = 0;
+    });
+}
+
+document.getElementById('status-bar').addEventListener('click', (e) => {
+  const btn = e.target.closest('button[data-opage]');
+  if (!btn || !_cachedOppRows || !_cachedOppRows.length) return;
+  const sorted = _sortOppRows(_cachedOppRows);
+  const totalPages = Math.max(1, Math.ceil(sorted.length / PAGE_SIZE));
+  const act = btn.dataset.opage;
+  if (act === 'first') _oppPage = 0;
+  else if (act === 'prev') _oppPage = Math.max(0, _oppPage - 1);
+  else if (act === 'next') _oppPage = Math.min(totalPages - 1, _oppPage + 1);
+  else if (act === 'last') _oppPage = totalPages - 1;
+  renderOppTable(undefined);
+});
+
+document.getElementById('history-bar').addEventListener('click', (e) => {
+  const btn = e.target.closest('button[data-hpage]');
+  if (!btn || !_historySessionsCache || !_historySessionsCache.length) return;
+  const total = _historySessionsCache.length;
+  const totalPages = Math.max(1, Math.ceil(total / PAGE_SIZE));
+  const act = btn.dataset.hpage;
+  if (act === 'first') _historyPage = 0;
+  else if (act === 'prev') _historyPage = Math.max(0, _historyPage - 1);
+  else if (act === 'next') _historyPage = Math.min(totalPages - 1, _historyPage + 1);
+  else if (act === 'last') _historyPage = totalPages - 1;
+  _renderHistoryRows();
+});
+
+setInterval(() => {
+  const hp = document.getElementById('history-panel');
+  if (hp && hp.classList.contains('active') && _historySessionsCache && _historySessionsCache.length)
+    _renderHistoryRows();
+}, 250);
+
+setInterval(() => {
+  const hp = document.getElementById('history-panel');
+  if (hp && hp.classList.contains('active')) loadHistory();
+}, 30000);
+
+// ── Uptime display ────────────────────────────────────────────────────────────
+function updateUptime(startTs) {
+  if (!startTs) return;
+  serverStartTs = startTs;
+}
+setInterval(() => {
+  // current time
+  const now = new Date();
+  const clockStr = now.toLocaleTimeString('zh-CN', {hour12: false});
+  document.getElementById('info-clock').textContent = clockStr + '\u3000';
+  // uptime
+  if (!serverStartTs) return;
+  const sec = Math.floor(Date.now() / 1000 - serverStartTs);
+  const h = Math.floor(sec / 3600), m = Math.floor((sec % 3600) / 60), s = sec % 60;
+  let txt;
+  if (h > 0) txt = h + 'h' + String(m).padStart(2,'0') + 'm' + String(s).padStart(2,'0') + 's';
+  else if (m > 0) txt = m + 'm' + String(s).padStart(2,'0') + 's';
+  else txt = s + 's';
+  document.getElementById('info-uptime').textContent = '已运行 ' + txt;
+
+}, 1000);
+
+// ── Positions panel ───────────────────────────────────────────────────────────
+let _lastPositions = [];
+
+function renderPositions() {
+  const tb = document.getElementById('positions-tbody');
+  if (!tb) return;
+  const positions = _lastPositions || [];
+  if (positions.length === 0) {
+    tb.innerHTML = '<tr><td colspan="9" style="text-align:center;color:var(--text-muted);padding:24px;font-family:sans-serif">无持仓数据</td></tr>';
+    return;
+  }
+  const rows = positions.map(p => {
+    const mark = p.current_mark_usdt != null ? fmtNum(p.current_mark_usdt, 2) : '—';
+    return `<tr>
+      <td class="r">${escHtml(p.id)}</td>
+      <td>${escHtml(p.exchange)}</td>
+      <td>${escHtml(p.symbol)}</td>
+      <td>${escHtml(p.expiry)}</td>
+      <td class="r">${escHtml(p.strike)}</td>
+      <td class="c">${escHtml(p.direction)}</td>
+      <td class="r">${mark}</td>
+      <td>${escHtml(p.opened_at)}</td>
+      <td class="c">${escHtml(p.status)}</td>
+    </tr>`;
+  });
+  tb.innerHTML = rows.join('');
+}
+
+// ── Accounts panel ────────────────────────────────────────────────────────────
+let _lastAccounts = [];
+
+function renderAccounts() {
+  const tb = document.getElementById('accounts-tbody');
+  if (!tb) return;
+  const accounts = _lastAccounts || [];
+  if (accounts.length === 0) {
+    tb.innerHTML = '<tr><td colspan="6" style="text-align:center;color:var(--text-muted);padding:24px;font-family:sans-serif">无账户数据（需配置 api_key）</td></tr>';
+    return;
+  }
+  const rows = accounts.map(a => {
+    const totalEq   = a.total_eq_usdt != null ? fmtNum(a.total_eq_usdt, 2) : '—';
+    const adjEq     = a.adj_eq_usdt   != null ? fmtNum(a.adj_eq_usdt, 2)   : '—';
+    const imPct     = a.im_pct != null ? a.im_pct.toFixed(2) + '%' : '—';
+    const mmPct     = a.mm_pct != null ? a.mm_pct.toFixed(2) + '%' : '—';
+    const imColor   = a.im_pct > 80 ? 'var(--red)' : a.im_pct > 50 ? 'var(--yellow)' : 'var(--green)';
+    const mmColor   = a.mm_pct > 50 ? 'var(--red)' : a.mm_pct > 30 ? 'var(--yellow)' : 'var(--text-dim)';
+    const arbLabel  = a.arbitrage_enabled
+      ? '<span style="color:var(--green);font-weight:bold">✓ 已开启</span>'
+      : '<span style="color:var(--text-muted)">✗ 未开启</span>';
+    return `<tr>
+      <td style="font-weight:bold">${escHtml(a.exchange)}</td>
+      <td class="r" style="color:var(--text)">${totalEq}</td>
+      <td class="r" style="color:var(--accent2)">${adjEq}</td>
+      <td class="r" style="color:${imColor}">${imPct}</td>
+      <td class="r" style="color:${mmColor}">${mmPct}</td>
+      <td class="c">${arbLabel}</td>
+    </tr>`;
+  });
+  tb.innerHTML = rows.join('');
+}
+
+// ── Overview panel ─────────────────────────────────────────────────────────────
+let activeExTab = '';
+
+function loadOverview() {
+  fetch('/api/triplet-summary')
+    .then(r => r.json())
+    .then(data => renderOverview(data))
+    .catch(err => {
+      const el = document.getElementById('overview-empty');
+      el.textContent = '加载失败: ' + err;
+      el.style.display = 'block';
+    });
+}
+
+function renderOverview(data) {
+  const exchanges = Object.keys(data).sort();
+  const emptyEl = document.getElementById('overview-empty');
+  if (exchanges.length === 0) {
+    emptyEl.textContent = '暂无数据';
+    emptyEl.style.display = 'block';
+    return;
+  }
+  emptyEl.style.display = 'none';
+
+  const exTabBar = document.getElementById('ex-tab-bar');
+  exTabBar.innerHTML = '';
+  for (const ex of exchanges) {
+    const btn = document.createElement('button');
+    btn.className = 'ex-tab';
+    btn.dataset.ex = ex;
+    btn.textContent = ex;
+    exTabBar.appendChild(btn);
+  }
+  if (!activeExTab || !data[activeExTab]) activeExTab = exchanges[0];
+  exTabBar.querySelectorAll('.ex-tab').forEach(b =>
+    b.classList.toggle('active', b.dataset.ex === activeExTab));
+
+  const scroll = document.getElementById('overview-scroll');
+  scroll.innerHTML = '';
+  for (const ex of exchanges) {
+    const pane = document.createElement('div');
+    pane.className = 'ex-pane' + (ex === activeExTab ? ' active' : '');
+    pane.dataset.ex = ex;
+    pane.appendChild(buildExPane(ex, data[ex]));
+    scroll.appendChild(pane);
+  }
+
+  exTabBar.addEventListener('click', e => {
+    const btn = e.target.closest('.ex-tab');
+    if (!btn) return;
+    activeExTab = btn.dataset.ex;
+    exTabBar.querySelectorAll('.ex-tab').forEach(b =>
+      b.classList.toggle('active', b === btn));
+    scroll.querySelectorAll('.ex-pane').forEach(p =>
+      p.classList.toggle('active', p.dataset.ex === activeExTab));
+    scroll.scrollTop = 0;
+  });
+}
+
+function buildExPane(exchange, exData) {
+  const frag = document.createDocumentFragment();
+  const symbols = Object.keys(exData.symbols).sort();
+  const settleType = exData.settle_type || '';
+
+  for (const sym of symbols) {
+    const symData = exData.symbols[sym];
+    const expiries = symData.expiries;
+    const nExp = Object.keys(expiries).length;
+    const idxPx = symData.index_price;
+
+    const block = document.createElement('div');
+    block.className = 'sym-block';
+
+    const title = document.createElement('div');
+    title.className = 'sym-title';
+    let titleHtml = escHtml(sym);
+    if (idxPx != null)
+      titleHtml += '  <span style="color:#e5c07b">现指 ' + escHtml(fmtPrice(idxPx, sym)) + '</span>';
+    if (settleType)
+      titleHtml += '<span class="settle-badge">' + escHtml(settleType) + '</span>';
+    title.innerHTML = titleHtml;
+    block.appendChild(title);
+
+    let totalStrikes = 0;
+    for (const stks of Object.values(expiries)) totalStrikes += stks.length;
+    const sub = document.createElement('div');
+    sub.className = 'sym-subtitle';
+    sub.textContent = '共 ' + nExp + ' 个到期日，' + totalStrikes + ' 个组合';
+    block.appendChild(sub);
+
+    const sep = document.createElement('div');
+    sep.className = 'sym-sep';
+    sep.textContent = '─'.repeat(72);
+    block.appendChild(sep);
+
+    const hdr = document.createElement('div');
+    hdr.className = 'sym-header';
+    hdr.innerHTML =
+      '<span style="width:90px;display:inline-block">到期日</span>' +
+      '<span style="width:70px;display:inline-block">状态</span>' +
+      '<span>行权价</span>';
+    block.appendChild(hdr);
+
+    for (const exp of Object.keys(expiries).sort()) {
+      const strikes = expiries[exp];
+      const row = document.createElement('div');
+      row.className = 'exp-row';
+
+      const dateEl = document.createElement('span');
+      dateEl.className = 'exp-date';
+      dateEl.textContent = exp;
+
+      const statusEl = document.createElement('span');
+      statusEl.className = 'exp-status';
+
+      const strikesEl = document.createElement('span');
+      strikesEl.className = 'exp-strikes';
+
+      if (strikes.length > 0) {
+        statusEl.innerHTML = '<span class="exp-matched">✓ 匹配</span>';
+        let atmStrike = null;
+        if (idxPx != null)
+          atmStrike = strikes.reduce((a,b) => Math.abs(a-idxPx) <= Math.abs(b-idxPx) ? a : b);
+        strikesEl.innerHTML = strikes.map(k => {
+          const isAtm = atmStrike !== null && k === atmStrike;
+          return '<span class="stk' + (isAtm ? ' stk-atm' : '') + '">' + escHtml(fmtStrike(k)) + '</span>';
+        }).join('');
+      } else {
+        statusEl.innerHTML = '<span class="exp-no-fut">— 无匹配</span>';
+      }
+
+      row.appendChild(dateEl);
+      row.appendChild(statusEl);
+      row.appendChild(strikesEl);
+      block.appendChild(row);
+    }
+    frag.appendChild(block);
+  }
+  return frag;
+}
+
+function showToast(n) {
+  const container = document.getElementById('toast-container');
+  const el = document.createElement('div');
+  el.className = 'toast';
+  el.innerHTML = `🚨 <b>${n.label}</b> (${n.exchange})<br>方向: ${n.direction} | 年化: ${n.ann_pct}% | 净利: ${n.net_profit} USDT`;
+  el.onclick = () => el.remove();
+  container.appendChild(el);
+  setTimeout(() => { el.style.transition = 'opacity 0.5s'; el.style.opacity = '0'; setTimeout(() => el.remove(), 500); }, 8000);
+}
+
+// ── WebSocket data feed ───────────────────────────────────────────────────────
+function setWsStatus(ok) {
+  const el = document.getElementById('ws-status');
+  if (ok) { el.className = 'ok'; el.textContent = '⬤ 已连接'; }
+  else     { el.className = 'err'; el.textContent = '⬤ 断开'; }
+}
+
+function connectData() {
+  const wsProto = (location.protocol === 'https:') ? 'wss:' : 'ws:';
+  const ws = new WebSocket(wsProto + '//' + location.host + '/ws-data');
+  ws.onopen = () => {
+    console.log('[ws] connected');
+    setWsStatus(true);
+  };
+  ws.onmessage = ev => {
+    let msg;
+    try { msg = JSON.parse(ev.data); } catch { return; }
+    if (msg.type === "notification") { showToast(msg); return; }
+    if (msg.meta)      { renderMetaBar(msg.meta); initPriceBar(msg.meta.symbols); }
+    if (msg.prices)    updatePriceBar(msg.prices);
+    if (msg.start_ts)  updateUptime(msg.start_ts);
+    if (msg.rows !== undefined) renderOppTable(msg.rows);
+    if (msg.positions !== undefined) { _lastPositions = msg.positions; renderPositions(); }
+    if (msg.accounts !== undefined) { _lastAccounts = msg.accounts; renderAccounts(); }
+  };
+  ws.onclose = () => {
+    setWsStatus(false);
+    console.log('[ws] disconnected, reconnecting in 2s...');
+    setTimeout(connectData, 2000);
+  };
+  ws.onerror = () => ws.close();
+  // keep-alive ping every 20s
+  const pingTimer = setInterval(() => {
+    if (ws.readyState === WebSocket.OPEN) ws.send('ping');
+    else clearInterval(pingTimer);
+  }, 20000);
+}
+connectData();
+</script>
+<div id="toast-container" style="position:fixed;bottom:24px;right:24px;z-index:9999;display:flex;flex-direction:column-reverse;gap:8px;max-width:360px;"></div>
+</body>
+</html>

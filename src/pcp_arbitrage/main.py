@@ -22,7 +22,7 @@ from pcp_arbitrage.signal_output import (
 )
 from pcp_arbitrage import web_dashboard as _wd
 
-_fmt = "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
+_fmt = "%(asctime)s [%(levelname)s] %(message)s"
 logging.basicConfig(level=logging.INFO, format=_fmt)
 
 
@@ -117,16 +117,21 @@ async def _run(cfg_path: str = "config.yaml", web_dashboard_override: str | None
         tasks.append(asyncio.create_task(position_tracker.run_position_tracker_loop(cfg)))
     # Periodic account balance fetch
     async def _balance_fetch_loop():
+        import random
         from pcp_arbitrage import account_fetcher
+        await asyncio.sleep(random.uniform(5, 15))  # 启动错开，避免与交易所握手撞车
         while True:
             try:
                 balances = await account_fetcher.fetch_all_balances(cfg)
                 _wd.update_account_balances(balances)
             except Exception as exc:
                 logger.warning("[main] Balance fetch failed: %s", exc)
-            await asyncio.sleep(60)
+            await asyncio.sleep(300)  # 5 分钟拉一次，避免频繁认证触发 429
     tasks.append(asyncio.create_task(_balance_fetch_loop()))
-    await asyncio.gather(*tasks)
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+    for task, result in zip(tasks, results):
+        if isinstance(result, Exception):
+            logger.error("[main] task %s exited with error: %s", task.get_name(), result)
 
 
 def main() -> None:

@@ -84,22 +84,24 @@ def per_leg_fees_from_stored_leg_px(
 class ArbitrageSignal:
     direction: str  # "forward" or "reverse"
     triplet: Triplet
-    call_price: float   # option price in USDT (coin price × spot)
-    put_price: float    # option price in USDT (coin price × spot)
+    call_price: float  # option price in USDT (coin price × spot)
+    put_price: float  # option price in USDT (coin price × spot)
     future_price: float
-    call_price_coin: float   # raw order book price (coin-denominated)
+    call_price_coin: float  # raw order book price (coin-denominated)
     put_price_coin: float
-    spot_price: float        # spot price used for conversion
+    spot_price: float  # spot price used for conversion
     gross_profit: float
     total_fee: float
     net_profit: float
     annualized_return: float  # e.g. 0.15 = 15%
     days_to_expiry: float
+    # 与 calculate_* 中 index_for_fee 一致（用于期权手续费名义等；USDT）
+    index_for_fee_usdt: float = 0.0
     # 三腿中与套利方向对应的对手盘挂量取最小（张数/数量，与交易所口径一致）
     tradeable_qty: float = 0.0
-    call_fee: float = 0.0   # 单边 call 手续费 (USDT)
-    put_fee: float = 0.0    # 单边 put 手续费 (USDT)
-    fut_fee: float = 0.0    # 单边 future 手续费 (USDT)
+    call_fee: float = 0.0  # 单边 call 手续费 (USDT)
+    put_fee: float = 0.0  # 单边 put 手续费 (USDT)
+    fut_fee: float = 0.0  # 单边 future 手续费 (USDT)
 
 
 def _option_fee(
@@ -249,6 +251,7 @@ def calculate_forward(
         fut_fee=fut_fee,
         annualized_return=ann,
         days_to_expiry=days_to_expiry,
+        index_for_fee_usdt=idx,
         tradeable_qty=tqty,
     )
 
@@ -319,5 +322,6 @@ def calculate_reverse(
         fut_fee=fut_fee,
         annualized_return=ann,
         days_to_expiry=days_to_expiry,
+        index_for_fee_usdt=idx,
         tradeable_qty=tqty,
     )

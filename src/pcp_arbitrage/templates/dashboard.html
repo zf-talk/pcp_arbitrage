@@ -20,6 +20,8 @@
     --status-act: #6ee7c5; --status-ina: #c8c8c8;
     --opp-pnl-trio-bg: rgba(0, 122, 204, 0.14);
     --opp-pnl-trio-bg-hover: rgba(0, 122, 204, 0.22);
+    --opp-red-bg: rgba(220, 80, 60, 0.12);
+    --opp-red-bg-hover: rgba(220, 80, 60, 0.20);
   }
   body.light {
     --bg: #f5f5f5; --bg2: #e8e8e8; --bg3: #ececec;
@@ -34,6 +36,8 @@
     --status-act: #0a5c40; --status-ina: #3d3d3d;
     --opp-pnl-trio-bg: rgba(0, 102, 184, 0.10);
     --opp-pnl-trio-bg-hover: rgba(0, 102, 184, 0.16);
+    --opp-red-bg: rgba(192, 57, 43, 0.09);
+    --opp-red-bg-hover: rgba(192, 57, 43, 0.15);
   }
 
   body {
@@ -51,6 +55,28 @@
     padding: 5px 14px; min-height: 30px; overflow-x: auto; white-space: nowrap;
   }
   #info-bar .lbl { color: var(--text-muted); font-size: 11px; font-family: sans-serif; margin-right: 4px; }
+  /* 第二行：1 币 ≈ 多少 USDT（与指数同源） */
+  #px-equiv-bar {
+    flex-shrink: 0;
+    display: flex;
+    align-items: flex-start;
+    gap: 10px;
+    background: var(--bg2);
+    border-bottom: 1px solid var(--border);
+    padding: 4px 14px 6px;
+    font-size: 11px;
+    font-family: Menlo, Monaco, "Courier New", monospace;
+    flex-wrap: wrap;
+  }
+  #px-equiv-bar .lbl { color: var(--text-muted); font-size: 10px; font-family: sans-serif; flex-shrink: 0; padding-top: 1px; }
+  .px-equiv-line {
+    color: var(--text-dim);
+    line-height: 1.45;
+    word-break: break-word;
+  }
+  .px-equiv-line .eq-sep { color: var(--border2); margin: 0 5px; user-select: none; }
+  .px-equiv-line .eq-sym { color: var(--accent2); font-weight: 600; }
+  .px-equiv-line .eq-num { color: var(--green); font-variant-numeric: tabular-nums; }
   .px-item { display: inline-flex; align-items: baseline; gap: 5px; }
   .px-sep  { color: var(--border2); margin: 0 8px; font-size: 13px; }
   .px-sym  { font-size: 11px; font-weight: 700; color: var(--accent2); }
@@ -121,6 +147,38 @@
   /* ── Opportunity table colours ────────────────────────────────────── */
   .c-ex   { color: var(--accent2); font-weight: 600; }
   .c-con  { color: var(--orange); }
+  /* 期权 / 期货外链：与合约文字拉开间距，避免挤在一起 */
+  .c-con .exch-links {
+    display: inline-flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 10px 14px;
+    margin-left: 12px;
+    vertical-align: middle;
+  }
+  .c-con a {
+    font-size: 11px;
+    font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+    font-weight: 600;
+    color: #7ecbff;
+    text-decoration: none;
+    white-space: nowrap;
+    padding: 1px 0;
+    border-bottom: 1px solid rgba(127, 203, 255, 0.35);
+  }
+  .c-con a:hover {
+    color: #b8e0ff;
+    border-bottom-color: rgba(184, 224, 255, 0.65);
+    text-decoration: none;
+  }
+  body.light .c-con a {
+    color: #005a9e;
+    border-bottom-color: rgba(0, 90, 158, 0.35);
+  }
+  body.light .c-con a:hover {
+    color: #003d6b;
+    border-bottom-color: rgba(0, 61, 107, 0.55);
+  }
   .c-dir  { font-family: sans-serif; }
   .c-fwd  { color: var(--accent2); }
   .c-rev  { color: var(--yellow); }
@@ -129,13 +187,20 @@
   .c-dim  { color: var(--text-dim); }
   .c-ann  { color: var(--green); font-weight: 700; }
   .c-max  { color: var(--accent2); }
+  /* 价差列展开：与主数字区分，避免过浅 */
   .gross-formula {
     display: block;
-    margin-top: 1px;
-    color: var(--text-muted);
-    font-size: 10px;
-    line-height: 1.2;
+    margin-top: 3px;
+    color: var(--formula-leg);
+    font-size: 11px;
+    font-weight: 500;
+    line-height: 1.35;
     white-space: nowrap;
+    letter-spacing: 0.01em;
+  }
+  body.light .gross-formula {
+    color: var(--formula-leg);
+    font-weight: 600;
   }
   .c-act  {
     color: var(--status-act); font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
@@ -157,7 +222,6 @@
   #opp-table tbody tr:hover td.col-pnl-trio {
     background: var(--opp-pnl-trio-bg-hover);
   }
-
   /* ── Overview panel ────────────────────────────────────────────────── */
   #ex-tab-bar {
     flex-shrink: 0; display: flex; flex-wrap: wrap;
@@ -203,32 +267,79 @@
     background: var(--bg2); border-top: 1px solid var(--border);
     padding: 3px 14px; font-size: 11px; font-family: sans-serif; color: var(--text-muted);
   }
-  .meta-stats-wrap {
-    display: flex; flex-direction: row; align-items: flex-start; gap: 12px;
-    flex-wrap: wrap;
+  /* ── 历史机会：统计 + 折线图 ───────────────────────────────────────── */
+  #history-overview {
+    flex-shrink: 0;
+    padding: 10px 14px 12px;
+    background: var(--bg2);
+    border-bottom: 1px solid var(--border);
+    font-family: sans-serif;
+    font-size: 11px;
+    color: var(--text-muted);
   }
-  .meta-panel-stats {
-    border: 1px solid var(--border2); border-radius: 3px; padding: 6px 10px;
-    display: inline-block; flex-shrink: 0; font-size: 11px; font-family: sans-serif;
-    align-self: stretch;
+  .history-stat-row {
+    display: flex; flex-wrap: wrap; gap: 12px; align-items: flex-start;
   }
-  .meta-title-stats {
-    color: var(--text-dim); font-weight: 700; font-size: 11px; margin-bottom: 6px;
-    text-transform: uppercase; letter-spacing: 0.5px;
+  .history-stat-card {
+    border: 1px solid var(--border2);
+    border-radius: 4px;
+    padding: 8px 12px;
+    background: var(--bg);
+    min-width: 220px;
   }
-  #opp-stats-bar table { border-collapse: collapse; }
-  #opp-stats-bar th {
-    text-align: left; color: var(--text-muted); padding: 2px 12px 2px 0;
-    font-weight: 400; white-space: nowrap;
+  .history-stat-card h4 {
+    margin: 0 0 8px;
+    font-size: 11px;
+    font-weight: 700;
+    color: var(--text-dim);
+    letter-spacing: 0.04em;
   }
-  #opp-stats-bar td {
-    text-align: right; padding: 2px 12px 2px 0; white-space: nowrap; min-width: 56px;
+  .history-stat-card .muted { color: var(--text-muted); font-weight: 400; }
+  .history-stat-table { border-collapse: collapse; width: 100%; }
+  .history-stat-table th {
+    text-align: left; color: var(--text-muted); padding: 2px 10px 2px 0;
+    font-weight: 500; white-space: nowrap;
   }
-  #opp-stats-bar td.s-cnt { color: var(--accent2); font-weight: 600; }
-  #opp-stats-bar td.s-pnl { color: var(--yellow); font-weight: 600; }
-  #opp-stats-bar .s-label { color: var(--text-dim); text-align: left; }
+  .history-stat-table td {
+    text-align: right; padding: 2px 0 2px 10px;
+    font-variant-numeric: tabular-nums;
+    color: var(--text);
+  }
+  .history-stat-table td.s-cnt { color: var(--accent2); font-weight: 600; }
+  .history-stat-table td.s-pnl { color: var(--yellow); font-weight: 600; }
+  .history-stat-table .s-label { color: var(--text-dim); text-align: left; }
+  .history-total-grid {
+    display: grid;
+    grid-template-columns: auto 1fr;
+    gap: 4px 16px;
+    font-variant-numeric: tabular-nums;
+  }
+  .history-total-grid .lk { color: var(--text-dim); }
+  .history-total-grid .lv { text-align: right; color: var(--text); }
+  .history-chart-card {
+    margin-top: 12px;
+    border: 1px solid var(--border2);
+    border-radius: 4px;
+    padding: 8px 12px 10px;
+    background: var(--bg);
+  }
+  .history-chart-title {
+    font-size: 11px;
+    font-weight: 700;
+    color: var(--text-dim);
+    margin-bottom: 6px;
+  }
+  .history-chart-title .muted { font-weight: 400; color: var(--text-muted); }
+  #history-expmax-chart { display: block; width: 100%; height: 200px; }
   #opp-page-bar { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
   #opp-updated { margin-left: auto; }
+  #opp-sort-bar { display: inline-flex; gap: 4px; align-items: center; font-family: sans-serif; font-size: 11px; margin-left: auto; }
+  #opp-sort-bar span { color: var(--text-muted); }
+  .opp-sort-btn {
+    padding: 1px 7px; border-radius: 3px; border: 1px solid var(--border2);
+    background: var(--bg3); color: var(--text-dim); cursor: pointer; font-size: 11px; font-family: sans-serif;
+  }
+  .opp-sort-btn.active { background: var(--accent); color: #fff; border-color: var(--accent); }
 
   /* 分页条（机会 / 历史共用样式） */
   .page-bar {
@@ -335,7 +446,7 @@
     max-width: 720px;
   }
 
-  /* ── Meta bar (交易所信息 + 配置 + 今日统计) ─────────────────────────── */
+  /* ── Meta bar (交易所信息 + 配置) ───────────────────────────────────── */
   #meta-bar {
     flex-shrink: 0; background: var(--bg2); border-bottom: 1px solid var(--border);
     padding: 8px 14px; font-family: sans-serif; font-size: 11px; color: var(--text-muted);
@@ -401,6 +512,35 @@
     from { opacity: 0; transform: translateX(40px); }
     to   { opacity: 1; transform: translateX(0); }
   }
+  /* ── 详情弹窗 ──────────────────────────────────────────────────────── */
+  #detail-overlay {
+    display: none; position: fixed; inset: 0; z-index: 1000;
+    background: rgba(0,0,0,0.55); align-items: center; justify-content: center;
+  }
+  #detail-overlay.open { display: flex; }
+  #detail-modal {
+    background: var(--bg3); border: 1px solid var(--border2); border-radius: 8px;
+    padding: 20px 24px; min-width: 420px; max-width: 580px; width: 90%;
+    max-height: 85vh; overflow-y: auto; font-size: 12px; position: relative;
+  }
+  #detail-modal h3 { margin: 0 0 14px; font-size: 14px; color: var(--accent2); font-family: sans-serif; }
+  .detail-section { margin-bottom: 14px; }
+  .detail-section-title {
+    font-family: sans-serif; font-size: 11px; color: var(--text-muted);
+    text-transform: uppercase; letter-spacing: .05em; margin-bottom: 6px;
+    border-bottom: 1px solid var(--border); padding-bottom: 3px;
+  }
+  .detail-row { display: flex; justify-content: space-between; padding: 2px 0; line-height: 1.6; }
+  .detail-key { color: var(--text-dim); }
+  .detail-val { color: var(--text); text-align: right; font-variant-numeric: tabular-nums; }
+  .detail-val.pos { color: var(--green); }
+  .detail-val.neg { color: var(--red); }
+  #detail-close {
+    position: absolute; top: 12px; right: 14px;
+    background: none; border: none; color: var(--text-muted);
+    font-size: 18px; cursor: pointer; line-height: 1;
+  }
+  #detail-close:hover { color: var(--text); }
 </style>
 </head>
 <body>
@@ -415,7 +555,6 @@
   <span id="ws-status" class="err">⬤ 连接中…</span>
   <button id="theme-btn" onclick="toggleTheme()">☀️ 浅色</button>
 </div>
-
 <!-- Tab bar -->
 <div id="tab-bar">
   <div class="tab active" data-panel="opp-panel">机会监控</div>
@@ -433,32 +572,41 @@
     <div id="meta-bar"></div>
     <div class="tbl-scroll">
       <table class="data-table" id="opp-table">
-        <thead><tr>
+        <thead>
+        <tr>
           <th>交易所</th>
           <th>合约</th>
-          <th class="r">K</th>
+          <th class="r">行权价 (K)</th>
+          <th class="r">指数</th>
           <th class="r">距到期</th>
           <th class="c">方向</th>
-          <th class="r">价差</th>
-          <th class="r">手续费</th>
+          <th class="r col-pnl-trio">价差</th>
+          <th class="r col-pnl-trio">手续费</th>
           <th class="r col-pnl-trio">净利</th>
           <th class="r col-pnl-trio">深度</th>
-          <th class="r col-pnl-trio">预期最大收益</th>
-          <th class="r">年化</th>
-          <th class="r">历史最大年化 / 时长</th>
+          <th class="r col-pnl-trio" id="th-expected-max">预期最大收益</th>
+          <th class="r col-pnl-trio" id="th-ann">当前年化 / 时长</th>
+          <th class="r" id="th-hist-ann">历史最大年化 / 时长</th>
+          <th class="r" id="th-last-active">最后活跃时间</th>
           <th class="c">状态</th>
-          <th class="r">最后活跃时间</th>
           <th class="c">操作</th>
-        </tr></thead>
+        </tr>
+        </thead>
         <tbody id="opp-tbody">
-          <tr><td colspan="15" style="text-align:center;color:var(--text-muted);padding:24px;font-family:sans-serif">等待机会数据…</td></tr>
+          <tr><td colspan="16" style="text-align:center;color:var(--text-muted);padding:24px;font-family:sans-serif">等待机会数据…</td></tr>
         </tbody>
       </table>
     </div>
     <div id="status-bar">
       <span id="opp-count"></span>
       <span id="opp-page-bar" class="page-bar"></span>
-      <span id="opp-updated"></span>
+      <span id="opp-sort-bar">
+        <span>排序:</span>
+        <button class="opp-sort-btn active" data-sort="expected_max">预期最大收益</button>
+        <button class="opp-sort-btn" data-sort="ann">当前年化</button>
+        <button class="opp-sort-btn" data-sort="hist_ann">历史最大年化</button>
+        <button class="opp-sort-btn" data-sort="last_active">最后活跃</button>
+      </span>
     </div>
     <details id="help-doc">
       <summary>
@@ -510,6 +658,9 @@
   </div>
 
   <div class="panel" id="history-panel">
+    <div id="history-overview">
+      <div id="history-overview-inner" class="muted" style="font-style:italic">切换到此标签加载统计与图表…</div>
+    </div>
     <div class="tbl-scroll">
       <table class="data-table" id="history-table">
         <thead><tr>
@@ -590,10 +741,12 @@
 <script>
 // ── Theme ────────────────────────────────────────────────────────────────────
 let _themeOverride = localStorage.getItem('theme');  // null = auto, 'dark', 'light'
+let _lastDailyExpectedMax = null;
 
 function applyTheme(mode) {
   document.body.classList.toggle('light', mode === 'light');
   document.getElementById('theme-btn').textContent = mode === 'light' ? '🌙 深色' : '☀️ 浅色';
+  if (typeof redrawHistoryExpMaxChart === 'function') redrawHistoryExpMaxChart();
 }
 function autoTheme() {
   const h = new Date().getHours();
@@ -627,6 +780,27 @@ document.querySelectorAll('.tab').forEach(tab => {
 });
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
+function buildExchangeLinks(exchange, symbol) {
+  const sym = symbol.toLowerCase();
+  const SYM = symbol.toUpperCase();
+  let optUrl = null, futUrl = null;
+  if (exchange === 'okx') {
+    optUrl = `https://www.okx.com/zh-hans/trade-option-chain/${sym}-usd`;
+    futUrl = `https://www.okx.com/zh-hans/trade-futures/${sym}-usd-weekly`;
+  } else if (exchange === 'binance') {
+    optUrl = `https://www.binance.com/en/options?currency=${SYM}`;
+    futUrl = `https://www.binance.com/en/futures/${SYM}USDT`;
+  } else if (exchange === 'deribit' || exchange === 'deribit_linear') {
+    optUrl = `https://www.deribit.com/options/${SYM}`;
+    futUrl = `https://www.deribit.com/futures/${SYM}`;
+  }
+  const parts = [];
+  const a = (url, label) => `<a href="${url}" target="_blank" rel="noopener">${label}</a>`;
+  if (optUrl) parts.push(a(optUrl, '期权'));
+  if (futUrl) parts.push(a(futUrl, '期货'));
+  if (parts.length === 0) return '';
+  return '<span class="exch-links">' + parts.join('') + '</span>';
+}
 function escHtml(s) {
   return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
 }
@@ -684,6 +858,18 @@ function fmtAnnPctOnly(pct) {
   if (pct == null || !Number.isFinite(Number(pct))) return '<span class="c-dim">—</span>';
   return Number(pct).toFixed(2) + '%';
 }
+/** 年化 + 本次持续时长（机会监控「年化」列）。 */
+function fmtAnnWithDur(r) {
+  const annStr = fmtAnnPctOnly(r.ann_pct);
+  let durSec = null;
+  if (r.active && r.first_active != null) {
+    durSec = Date.now() / 1000 - r.first_active;
+  } else if (!r.active && r.frozen_duration != null) {
+    durSec = r.frozen_duration;
+  }
+  const durStr = durSec != null ? fmtDuration(durSec) : '—';
+  return annStr + '<span style="color:var(--text-dim)"> / ' + durStr + '</span>';
+}
 /** 历史表中该组合年化最高的一条的「年化 / 时长」。 */
 function fmtHistPeakAnnWithDur(hAnn, hDurSec) {
   if (hAnn == null || !Number.isFinite(Number(hAnn))) return '<span class="c-dim">—</span>';
@@ -692,7 +878,7 @@ function fmtHistPeakAnnWithDur(hAnn, hDurSec) {
     const n = Number(hDurSec);
     if (Number.isFinite(n) && n >= 0) d = fmtDuration(n);
   }
-  return Number(hAnn).toFixed(2) + '% / ' + d;
+  return Number(hAnn).toFixed(2) + '%<span style="color:var(--text-dim)"> / ' + d + '</span>';
 }
 /** Unix 秒时间戳（含小数）→ 本地时间（到秒）。 */
 function fmtUnixSecLocal(sec) {
@@ -729,9 +915,7 @@ function fmtUtcIsoToLocal(s) {
       hour: '2-digit',
       minute: '2-digit',
       second: '2-digit',
-      fractionalSecondDigits: 3,
       hour12: false,
-      timeZoneName: 'short',
     });
     return escHtml(txt);
   } catch {
@@ -758,30 +942,20 @@ let _historyPage = 0;
 const _orderingKeys = new Set();
 
 /** 生成下单按钮 HTML。
- *  - active + OKX + 无持仓 + ann_pct < order_min_ann：显示"下单"按钮
- *  - active + has_position：显示"已持仓"（disabled）
- *  - active + ann_pct >= order_min_ann：显示"下单中"（disabled，自动下单触发）
- *  - 其他：空
+ *  - has_position / 自动下单中 / 手动下单中：不显示按钮
+ *  - 其他：始终显示可点击"下单"按钮
  */
 function fmtOrderBtn(r) {
-  if (!r.active) return '';
-  if (r.exchange.toLowerCase() !== 'okx') return '';
   const key = r.exchange + '\0' + r.label + '\0' + r.direction;
-  if (r.has_position) {
-    return '<button class="order-btn order-btn-done" disabled>已持仓</button>';
-  }
+  if (r.has_position) return '';
   const orderMinAnn = (_lastMeta && _lastMeta.order_min_ann != null) ? _lastMeta.order_min_ann * 100 : null;
-  if (orderMinAnn != null && r.ann_pct >= orderMinAnn) {
-    return '<button class="order-btn order-btn-auto" disabled>下单中</button>';
-  }
-  if (_orderingKeys.has(key)) {
-    return '<button class="order-btn order-btn-pending" disabled>下单中…</button>';
-  }
-  return '<button class="order-btn order-btn-manual" onclick="submitManualOrder(' +
-    JSON.stringify(r.exchange) + ',' +
-    JSON.stringify(r.label) + ',' +
-    JSON.stringify(r.direction) +
-    ')">下单</button>';
+  if (r.active && orderMinAnn != null && r.ann_pct >= orderMinAnn) return '';
+  if (_orderingKeys.has(key)) return '';
+  return '<button class="order-btn order-btn-manual"' +
+    ' data-exchange="' + escHtml(r.exchange) + '"' +
+    ' data-label="' + escHtml(r.label) + '"' +
+    ' data-direction="' + escHtml(r.direction) + '"' +
+    ' onclick="submitManualOrder(this.dataset.exchange,this.dataset.label,this.dataset.direction)">下单</button>';
 }
 
 async function submitManualOrder(exchange, label, direction) {
@@ -798,12 +972,14 @@ async function submitManualOrder(exchange, label, direction) {
     });
     const data = await resp.json();
     if (!resp.ok || !data.ok) {
-      alert('下单失败：' + (data.error || resp.status));
+      // Show error toast and re-enable button
+      showToast({type: 'order_error', label, exchange, message: data.error || ('HTTP ' + resp.status)});
       _orderingKeys.delete(key);
     }
-    // On success keep key in _orderingKeys; has_position will update via WS broadcast
+    // On success: keep key in _orderingKeys (button stays disabled);
+    // success toast and has_position update arrive via WS broadcast
   } catch (e) {
-    alert('下单请求异常：' + e);
+    showToast({type: 'order_error', label, exchange, message: '请求异常: ' + e});
     _orderingKeys.delete(key);
   }
   if (_cachedOppRows !== null) renderOppTable();
@@ -811,12 +987,56 @@ async function submitManualOrder(exchange, label, direction) {
 
 
 
+let _oppSortMode = 'expected_max';
+
 function _sortOppRows(source) {
   return source.slice().sort((a, b) => {
+    // active 行始终排在 inactive 之前
     if (a.active !== b.active) return b.active - a.active;
-    return b.ann_pct - a.ann_pct;
+    if (_oppSortMode === 'ann') {
+      return (b.ann_pct ?? -Infinity) - (a.ann_pct ?? -Infinity);
+    } else if (_oppSortMode === 'hist_ann') {
+      return (b.hist_ann_pct ?? -Infinity) - (a.hist_ann_pct ?? -Infinity);
+    } else if (_oppSortMode === 'expected_max') {
+      return (b.expected_max ?? -Infinity) - (a.expected_max ?? -Infinity);
+    } else {
+      // last_active：last_active_eval 倒序，null 排最后
+      const at = a.last_active_eval ?? 0;
+      const bt = b.last_active_eval ?? 0;
+      return bt - at;
+    }
   });
 }
+
+const _sortThMap = {
+  'last_active': 'th-last-active',
+  'ann':         'th-ann',
+  'hist_ann':    'th-hist-ann',
+  'expected_max':'th-expected-max',
+};
+function _updateSortThIcon() {
+  Object.values(_sortThMap).forEach(id => {
+    const el = document.getElementById(id);
+    if (!el) return;
+    el.textContent = el.textContent.replace(' ⬇️', '');
+  });
+  const activeId = _sortThMap[_oppSortMode];
+  if (activeId) {
+    const el = document.getElementById(activeId);
+    if (el) el.textContent += ' ⬇️';
+  }
+}
+_updateSortThIcon();
+
+document.getElementById('opp-sort-bar').addEventListener('click', e => {
+  const btn = e.target.closest('.opp-sort-btn');
+  if (!btn) return;
+  _oppSortMode = btn.dataset.sort;
+  document.querySelectorAll('.opp-sort-btn').forEach(b => b.classList.toggle('active', b === btn));
+  _updateSortThIcon();
+  _oppPage = 0;
+  renderOppTable(undefined);
+});
 
 function _paginationButtons(prefix, disabledFirstPrev, disabledNextLast) {
   const d0 = disabledFirstPrev ? ' disabled' : '';
@@ -834,6 +1054,38 @@ function _paginationButtons(prefix, disabledFirstPrev, disabledNextLast) {
 // ── Index price bar ───────────────────────────────────────────────────────────
 const prevPrices = {};
 let priceSymOrder = [];
+
+/** 与顶部数字列一致：低价币多小数，大额千分位 */
+function fmtPxForEquiv(sym, px) {
+  if (px == null || !Number.isFinite(px)) return null;
+  const hi = ['DOGE','TRX','SHIB','PEPE'];
+  if (hi.includes((sym || '').toUpperCase())) return px.toFixed(4);
+  if (px >= 1000) return px.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+  return px.toFixed(4);
+}
+
+function updateEquivLine(prices) {
+  const el = document.getElementById('px-equiv-line');
+  if (!el || !prices) return;
+  const syms = priceSymOrder.length ? priceSymOrder : Object.keys(prices);
+  const chunks = [];
+  for (const sym of syms) {
+    const px = prices[sym];
+    const s = fmtPxForEquiv(sym, px);
+    if (s == null) continue;
+    const SU = (sym || '').toUpperCase();
+    chunks.push(
+      '<span class="eq-sym">1 ' + escHtml(SU) + '</span>' +
+      ' <span style="color:var(--text-muted)">≈</span> ' +
+      '<span class="eq-num">' + s + '</span> USDT'
+    );
+  }
+  if (chunks.length === 0) {
+    el.innerHTML = '<span style="color:var(--text-muted)">等待各标的指数…</span>';
+    return;
+  }
+  el.innerHTML = chunks.join('<span class="eq-sep">·</span>');
+}
 
 function initPriceBar(symbols) {
   const area = document.getElementById('px-area');
@@ -890,6 +1142,7 @@ function updatePriceBar(prices) {
     }
     prevPrices[sym] = px;
   }
+  updateEquivLine(prevPrices);
 }
 
 // ── Opportunity table ─────────────────────────────────────────────────────────
@@ -952,15 +1205,7 @@ function _updateMetaBar() {
           '<div class="meta-cfg-item"><span class="lk">最短到期</span><span class="lv">' + dte + ' 天</span></div>' +
         '</div>' +
       '</div>' +
-      '<div class="meta-stats-wrap">' +
-        '<div class="meta-panel-stats">' +
-          '<div class="meta-title-stats">今日机会统计</div>' +
-          '<div id="opp-stats-bar"></div>' +
-        '</div>' +
-      '</div>' +
     '</div>';
-  if (_cachedOppRows !== null) _renderOppStats(_cachedOppRows);
-  else _renderOppStats([]);
 }
 
 function renderOppTable(rows) {
@@ -972,7 +1217,7 @@ function renderOppTable(rows) {
 
   if (sorted.length === 0) {
     document.getElementById('opp-tbody').innerHTML =
-      '<tr><td colspan="15" style="text-align:center;color:var(--text-muted);padding:24px;font-family:sans-serif">暂无机会</td></tr>';
+      '<tr><td colspan="16" style="text-align:center;color:var(--text-muted);padding:24px;font-family:sans-serif">暂无机会</td></tr>';
     document.getElementById('opp-count').textContent = '';
     if (pgBar) pgBar.innerHTML = '';
     _oppPage = 0;
@@ -1007,23 +1252,32 @@ function renderOppTable(rows) {
     const stTxt  = r.active ? '✅ active' : '⏸️ inactive';
     const expMax = r.expected_max != null ? fmtNum(r.expected_max, 2) : '—';
     const expMaxCls = r.expected_max != null && r.expected_max >= 0 ? 'c-pos' : 'c-neg';
+    const symForPx = (r.label || '').split('-')[0];
+    const idxCell = (r.index_price_usdt != null && Number.isFinite(Number(r.index_price_usdt)))
+      ? fmtPrice(Number(r.index_price_usdt), symForPx)
+      : '<span class="c-dim">—</span>';
+    const dk = _detailKey(r);
+    _oppDetailMap[dk] = r;
+    const detailBtn = '<button class="order-btn" style="background:var(--bg2);color:var(--text-dim);border-color:var(--border2)"' +
+      ' data-dk="' + escHtml(dk) + '" onclick="showDetail(this.dataset.dk)">详情</button>';
 
     html += '<tr class="' + rowCls + '">' +
       '<td class="c-ex">' + escHtml(r.exchange) + '</td>' +
-      '<td class="c-con">' + escHtml(r.label) + '</td>' +
+      '<td class="c-con">' + escHtml(r.label) + buildExchangeLinks(r.exchange, r.label.split('-')[0]) + '</td>' +
       '<td class="r c-dim">' + fmtStrike(r.strike) + '</td>' +
+      '<td class="r c-dim">' + idxCell + '</td>' +
       '<td class="r c-dim">' + fmtDte(r.days_to_expiry) + '</td>' +
       '<td class="c ' + dirCls + '">' + escHtml(r.direction) + '</td>' +
-      '<td class="r">' + fmtGrossWithFormula(r) + '</td>' +
-      '<td class="r c-dim">' + fmtFeeWithFormula(r) + '</td>' +
+      '<td class="r col-pnl-trio">' + fmtNum(r.gross, 2) + '</td>' +
+      '<td class="r col-pnl-trio c-dim">' + fmtFeeWithFormula(r) + '</td>' +
       '<td class="r col-pnl-trio ' + netCls + '">' + fmtNum(r.net, 2) + '</td>' +
       '<td class="r col-pnl-trio c-dim">' + (r.tradeable != null ? Number(r.tradeable).toPrecision(4) : '—') + '</td>' +
       '<td class="r col-pnl-trio ' + expMaxCls + '">' + expMax + '</td>' +
-      '<td class="r c-ann">' + fmtAnnPctOnly(r.ann_pct) + '</td>' +
+      '<td class="r col-pnl-trio c-ann">' + fmtAnnWithDur(r) + '</td>' +
       '<td class="r c-max">' + fmtHistPeakAnnWithDur(r.hist_ann_pct, r.hist_duration_sec) + '</td>' +
-      '<td class="c col-status ' + stCls + '">' + stTxt + '</td>' +
       '<td class="r c-dim">' + fmtUnixSecLocal(r.last_active_eval) + '</td>' +
-      '<td class="c">' + fmtOrderBtn(r) + '</td>' +
+      '<td class="c col-status ' + stCls + '">' + stTxt + '</td>' +
+      '<td class="c">' + detailBtn + ' ' + fmtOrderBtn(r) + '</td>' +
       '</tr>';
   }
   document.getElementById('opp-tbody').innerHTML = html;
@@ -1031,44 +1285,6 @@ function renderOppTable(rows) {
   document.getElementById('opp-count').textContent =
     act + ' 个 active / ' + total + ' 个合计';
   const now = new Date().toLocaleTimeString('zh-CN',{hour12:false});
-  document.getElementById('opp-updated').textContent = '更新于 ' + now;
-  _renderOppStats(source);
-}
-
-function _renderOppStats(rows) {
-  const bar = document.getElementById('opp-stats-bar');
-  if (!bar) return;
-  const todayStr = new Date().toLocaleDateString('zh-CN', {year:'numeric',month:'2-digit',day:'2-digit'});
-  // Use all rows (today = last_active_eval within today, or active rows)
-  // "今日" = row has been active today (last_active_eval timestamp is today)
-  function isToday(r) {
-    const ts = r.last_active_eval || r.first_active;
-    if (!ts) return r.active;
-    const d = new Date(ts * 1000);
-    return d.toLocaleDateString('zh-CN', {year:'numeric',month:'2-digit',day:'2-digit'}) === todayStr;
-  }
-  const todayRows = rows.filter(isToday);
-  const fwdRows = todayRows.filter(r => r.direction === '正向');
-  const revRows = todayRows.filter(r => r.direction === '反向');
-  function sumMax(rs) {
-    return rs.reduce((s, r) => s + (r.expected_max != null ? r.expected_max : 0), 0);
-  }
-  const fmtC = n => n.toString();
-  const fmtP = n => fmtNum(n, 2);
-  bar.innerHTML =
-    '<table><thead><tr>' +
-      '<th></th><th>机会个数</th><th>预期最大收益 (USDT)</th>' +
-    '</tr></thead><tbody>' +
-      '<tr><td class="s-label">今日正向机会</td>' +
-        '<td class="s-cnt">' + fmtC(fwdRows.length) + '</td>' +
-        '<td class="s-pnl">' + fmtP(sumMax(fwdRows)) + '</td></tr>' +
-      '<tr><td class="s-label">今日反向机会</td>' +
-        '<td class="s-cnt">' + fmtC(revRows.length) + '</td>' +
-        '<td class="s-pnl">' + fmtP(sumMax(revRows)) + '</td></tr>' +
-      '<tr><td class="s-label">今日机会</td>' +
-        '<td class="s-cnt">' + fmtC(todayRows.length) + '</td>' +
-        '<td class="s-pnl">' + fmtP(sumMax(todayRows)) + '</td></tr>' +
-    '</tbody></table>';
 }
 
 setInterval(() => {
@@ -1079,6 +1295,166 @@ setInterval(() => {
 
 // ── History (open + closed sessions) ──────────────────────────────────────────
 let _historySessionsCache = null;
+
+function _cssVar(name, fallback) {
+  const v = getComputedStyle(document.body).getPropertyValue(name).trim();
+  return v || fallback;
+}
+
+/** 最近 30 日（服务器本地日）：每个机会 exchange+contract+direction 每日只计一次，取 MAX(预期最大) 再按日求和 */
+function drawHistoryExpMaxChart(series) {
+  _lastDailyExpectedMax = series;
+  const canvas = document.getElementById('history-expmax-chart');
+  if (!canvas || !series || !series.length) return;
+  const parent = canvas.parentElement;
+  const wCss = Math.max(280, Math.floor((parent && parent.clientWidth) ? parent.clientWidth - 24 : 600));
+  const hCss = 200;
+  const dpr = window.devicePixelRatio || 1;
+  canvas.style.width = wCss + 'px';
+  canvas.style.height = hCss + 'px';
+  canvas.width = Math.floor(wCss * dpr);
+  canvas.height = Math.floor(hCss * dpr);
+  const ctx = canvas.getContext('2d');
+  if (!ctx) return;
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  ctx.scale(dpr, dpr);
+  const w = wCss, h = hCss;
+  const pl = 46, pr = 10, pt = 8, pb = 30;
+  const pw = w - pl - pr, ph = h - pt - pb;
+  const vals = series.map(s => Number(s.sum_expected_max) || 0);
+  let ymax = Math.max.apply(null, vals);
+  if (!Number.isFinite(ymax) || ymax <= 0) ymax = 1;
+  else ymax *= 1.08;
+  const lineCol = _cssVar('--accent', '#007acc');
+  const gridCol = _cssVar('--border2', '#444');
+  const txtCol = _cssVar('--text-muted', '#888');
+  ctx.clearRect(0, 0, w, h);
+  ctx.fillStyle = _cssVar('--bg', '#1e1e1e');
+  ctx.fillRect(0, 0, w, h);
+  // grid + y labels
+  const yticks = 4;
+  ctx.font = '10px sans-serif';
+  ctx.textAlign = 'right';
+  ctx.textBaseline = 'middle';
+  for (let g = 0; g <= yticks; g++) {
+    const frac = g / yticks;
+    const yv = ymax * (1 - frac);
+    const y = pt + ph * frac;
+    ctx.strokeStyle = gridCol;
+    ctx.lineWidth = 1;
+    ctx.globalAlpha = 0.5;
+    ctx.beginPath();
+    ctx.moveTo(pl, y);
+    ctx.lineTo(pl + pw, y);
+    ctx.stroke();
+    ctx.globalAlpha = 1;
+    ctx.fillStyle = txtCol;
+    ctx.fillText(yv.toFixed(1), pl - 4, y);
+  }
+  const n = vals.length;
+  function xAt(i) {
+    if (n <= 1) return pl + pw / 2;
+    return pl + (i / (n - 1)) * pw;
+  }
+  function yAt(v) {
+    const t = v / ymax;
+    return pt + ph * (1 - t);
+  }
+  // area
+  ctx.beginPath();
+  ctx.moveTo(xAt(0), pt + ph);
+  for (let i = 0; i < n; i++) ctx.lineTo(xAt(i), yAt(vals[i]));
+  ctx.lineTo(xAt(n - 1), pt + ph);
+  ctx.closePath();
+  ctx.fillStyle = lineCol;
+  ctx.globalAlpha = 0.12;
+  ctx.fill();
+  ctx.globalAlpha = 1;
+  // line
+  ctx.beginPath();
+  ctx.strokeStyle = lineCol;
+  ctx.lineWidth = 2;
+  for (let i = 0; i < n; i++) {
+    const x = xAt(i), y = yAt(vals[i]);
+    if (i === 0) ctx.moveTo(x, y);
+    else ctx.lineTo(x, y);
+  }
+  ctx.stroke();
+  // points
+  ctx.fillStyle = lineCol;
+  for (let i = 0; i < n; i++) {
+    ctx.beginPath();
+    ctx.arc(xAt(i), yAt(vals[i]), 2.2, 0, Math.PI * 2);
+    ctx.fill();
+  }
+  // x labels: 起、终 + 中间约 3 个
+  ctx.fillStyle = txtCol;
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'top';
+  const ixLabel = [0, Math.floor(n / 4), Math.floor(n / 2), Math.floor((3 * n) / 4), n - 1];
+  const seen = new Set();
+  for (const ii of ixLabel) {
+    if (ii < 0 || ii >= n || seen.has(ii)) continue;
+    seen.add(ii);
+    const day = series[ii].day || '';
+    const short = day.length >= 10 ? day.slice(5, 10) : day;
+    ctx.fillText(short, xAt(ii), h - pb + 4);
+  }
+}
+
+function redrawHistoryExpMaxChart() {
+  if (_lastDailyExpectedMax && _lastDailyExpectedMax.length)
+    drawHistoryExpMaxChart(_lastDailyExpectedMax);
+}
+
+function renderHistoryOverview(sessionStats, dailySeries) {
+  const wrap = document.getElementById('history-overview-inner');
+  if (!wrap) return;
+  const daily = dailySeries || [];
+  const fmt2 = x =>
+    x != null && Number.isFinite(Number(x)) ? fmtNum(Number(x), 2) : '—';
+  let todayBlock = '';
+  let totalBlock = '';
+  if (sessionStats && sessionStats.today) {
+    const t = sessionStats.today;
+    todayBlock =
+      '<table class="history-stat-table"><thead><tr>' +
+      '<th></th><th style="text-align:right">个数</th><th style="text-align:right">预期最大 (USDT)</th></tr></thead><tbody>' +
+      '<tr><td class="s-label">正向</td><td class="s-cnt">' + String(t.fwd_count) + '</td><td class="s-pnl">' + fmt2(t.sum_max_fwd) + '</td></tr>' +
+      '<tr><td class="s-label">反向</td><td class="s-cnt">' + String(t.rev_count) + '</td><td class="s-pnl">' + fmt2(t.sum_max_rev) + '</td></tr>' +
+      '<tr><td class="s-label">合计</td><td class="s-cnt">' + String(t.total_count) + '</td><td class="s-pnl">' + fmt2(t.sum_max_total) + '</td></tr>' +
+      '</tbody></table>';
+  } else {
+    todayBlock = '<span class="muted">暂无</span>';
+  }
+  if (sessionStats && sessionStats.all) {
+    const a = sessionStats.all;
+    totalBlock =
+      '<div class="history-total-grid">' +
+      '<span class="lk">已结束笔数</span><span class="lv">' + String(a.closed_sessions) + '</span>' +
+      '<span class="lk">平均年化</span><span class="lv">' + (Number.isFinite(Number(a.avg_ann_pct)) ? Number(a.avg_ann_pct).toFixed(2) + '%' : '—') + '</span>' +
+      '<span class="lk">最高年化</span><span class="lv">' + (Number.isFinite(Number(a.max_ann_pct)) ? Number(a.max_ann_pct).toFixed(2) + '%' : '—') + '</span>' +
+      '<span class="lk">平均时长</span><span class="lv">' + fmtDuration(a.avg_duration_sec) + '</span>' +
+      '<span class="lk">预期最大 Σ</span><span class="lv">' + fmt2(a.sum_expected_max) + '</span>' +
+      '</div>';
+  } else {
+    totalBlock = '<span class="muted">暂无</span>';
+  }
+  wrap.innerHTML =
+    '<div class="history-stat-row">' +
+      '<div class="history-stat-card">' +
+        '<h4>今日统计 <span class="muted">(本地日 · 每机会一行 · 多段取 MAX 预期最大)</span></h4>' + todayBlock +
+      '</div>' +
+      '<div class="history-stat-card">' +
+        '<h4>总计 <span class="muted">(已结束且 gross 已记账)</span></h4>' + totalBlock +
+      '</div>' +
+      '<div class="history-stat-card" style="flex:2;min-width:260px">' +
+        '<h4>最近 30 日 · 每日预期最大收益 <span class="muted">(USDT)</span></h4>' +
+        '<canvas id="history-expmax-chart" width="600" height="120"></canvas>' +
+      '</div>' +
+    '</div>';
+  requestAnimationFrame(function () { drawHistoryExpMaxChart(daily); });
+}
 
 function _renderHistoryRows() {
   const tb = document.getElementById('history-tbody');
@@ -1145,6 +1521,8 @@ function _renderHistoryRows() {
 function loadHistory() {
   const tb = document.getElementById('history-tbody');
   const bar = document.getElementById('history-bar');
+  const ov = document.getElementById('history-overview-inner');
+  if (ov) ov.innerHTML = '<span class="muted" style="font-style:italic">加载中…</span>';
   tb.innerHTML = '<tr><td colspan="12" style="text-align:center;color:var(--text-muted);padding:16px;font-family:sans-serif">加载中…</td></tr>';
   fetch('/api/opportunity-history?limit=500')
     .then(r => r.json())
@@ -1156,8 +1534,11 @@ function loadHistory() {
         bar.innerHTML = '';
         _historySessionsCache = null;
         _historyPage = 0;
+        if (ov) ov.innerHTML = '<span class="muted">' + escHtml(data.error) + '</span>';
+        _lastDailyExpectedMax = null;
         return;
       }
+      renderHistoryOverview(data.session_stats, data.daily_expected_max);
       if (sessions.length === 0) {
         tb.innerHTML = '<tr><td colspan="12" style="text-align:center;color:var(--text-muted);padding:16px;font-family:sans-serif">暂无记录</td></tr>';
         bar.innerHTML = '';
@@ -1173,6 +1554,8 @@ function loadHistory() {
       bar.innerHTML = escHtml(String(err));
       _historySessionsCache = null;
       _historyPage = 0;
+      if (ov) ov.innerHTML = '<span style="color:var(--red)">统计与列表加载失败</span>';
+      _lastDailyExpectedMax = null;
     });
 }
 
@@ -1212,6 +1595,15 @@ setInterval(() => {
   const hp = document.getElementById('history-panel');
   if (hp && hp.classList.contains('active')) loadHistory();
 }, 30000);
+
+let _historyResizeTimer;
+window.addEventListener('resize', () => {
+  clearTimeout(_historyResizeTimer);
+  _historyResizeTimer = setTimeout(() => {
+    const hp = document.getElementById('history-panel');
+    if (hp && hp.classList.contains('active')) redrawHistoryExpMaxChart();
+  }, 200);
+});
 
 // ── Uptime display ────────────────────────────────────────────────────────────
 function updateUptime(startTs) {
@@ -1441,10 +1833,19 @@ function showToast(n) {
   const container = document.getElementById('toast-container');
   const el = document.createElement('div');
   el.className = 'toast';
-  el.innerHTML = `🚨 <b>${n.label}</b> (${n.exchange})<br>方向: ${n.direction} | 年化: ${n.ann_pct}% | 净利: ${n.net_profit} USDT`;
+  if (n.type === 'order_success') {
+    el.style.borderLeft = '3px solid #16a34a';
+    el.innerHTML = `✅ <b>下单成功</b> ${escHtml(n.label)} (${escHtml(n.exchange)})<br><span style="font-size:11px;opacity:.85">${escHtml(n.message || '')}</span>`;
+  } else if (n.type === 'order_error') {
+    el.style.borderLeft = '3px solid #dc2626';
+    el.innerHTML = `❌ <b>下单失败</b> ${escHtml(n.label)} (${escHtml(n.exchange)})<br><span style="font-size:11px;opacity:.85">${escHtml(n.message || '')}</span>`;
+  } else {
+    el.innerHTML = `🚨 <b>${n.label}</b> (${n.exchange})<br>方向: ${n.direction} | 年化: ${n.ann_pct}% | 净利: ${n.net_profit} USDT`;
+  }
   el.onclick = () => el.remove();
   container.appendChild(el);
-  setTimeout(() => { el.style.transition = 'opacity 0.5s'; el.style.opacity = '0'; setTimeout(() => el.remove(), 500); }, 8000);
+  const dur = (n.type === 'order_error') ? 12000 : 8000;
+  setTimeout(() => { el.style.transition = 'opacity 0.5s'; el.style.opacity = '0'; setTimeout(() => el.remove(), 500); }, dur);
 }
 
 // ── WebSocket data feed ───────────────────────────────────────────────────────
@@ -1464,7 +1865,7 @@ function connectData() {
   ws.onmessage = ev => {
     let msg;
     try { msg = JSON.parse(ev.data); } catch { return; }
-    if (msg.type === "notification") { showToast(msg); return; }
+    if (msg.type === "notification" || msg.type === "order_success" || msg.type === "order_error") { showToast(msg); return; }
     if (msg.meta)      { renderMetaBar(msg.meta); initPriceBar(msg.meta.symbols); }
     if (msg.prices)    updatePriceBar(msg.prices);
     if (msg.start_ts)  updateUptime(msg.start_ts);
@@ -1485,7 +1886,100 @@ function connectData() {
   }, 20000);
 }
 connectData();
+
+// ── 详情弹窗 ──────────────────────────────────────────────────────────────────
+const _oppDetailMap = {};   // key → row object
+
+function _detailKey(r) { return r.exchange + '\0' + r.label + '\0' + r.direction; }
+
+function showDetail(key) {
+  const r = _oppDetailMap[key];
+  if (!r) return;
+  const f = (v, dec=2) => (v != null && Number.isFinite(Number(v))) ? Number(v).toFixed(dec) : '—';
+  const fPct = v => (v != null && Number.isFinite(Number(v))) ? Number(v).toFixed(2) + '%' : '—';
+  const valCls = v => (v != null && Number(v) >= 0) ? 'pos' : 'neg';
+
+  document.getElementById('detail-title').textContent =
+    r.exchange + '  ' + r.label + '  ' + r.direction;
+
+  const parts = (r.label || '').split('-');
+  const sym = parts[0] || '';
+  const expiry = parts[1] || '';
+
+  const sec = s => `<div class="detail-section-title">${s}</div>`;
+  const row = (k, v, cls='') =>
+    `<div class="detail-row"><span class="detail-key">${k}</span><span class="detail-val ${cls}">${v}</span></div>`;
+
+  let html = '';
+
+  // 基本信息
+  html += `<div class="detail-section">${sec('基本信息')}` +
+    row('交易所', escHtml(r.exchange)) +
+    row('标的', escHtml(sym)) +
+    row('到期日', escHtml(expiry)) +
+    row('行权价 (K)', f(r.strike, 0)) +
+    row('指数价', f(r.index_price_usdt)) +
+    row('距到期', r.days_to_expiry != null ? Number(r.days_to_expiry).toFixed(2) + ' 天' : '—') +
+    row('方向', escHtml(r.direction)) +
+    row('状态', r.active ? '✅ active' : '⏸️ inactive') +
+  '</div>';
+
+  // 价格
+  html += `<div class="detail-section">${sec('三腿价格 (USDT)')}` +
+    row('Call 价', f(r.call_px_usdt)) +
+    row('Put 价', f(r.put_px_usdt)) +
+    row('Future 价', f(r.fut_px_usdt)) +
+  '</div>';
+
+  // 损益
+  html += `<div class="detail-section">${sec('损益 (USDT)')}` +
+    row('价差（gross）', f(r.gross), valCls(r.gross)) +
+    row('手续费（总）', f(r.fee)) +
+    row('　Call 手续费', f(r.call_fee)) +
+    row('　Put 手续费', f(r.put_fee)) +
+    row('　Future 手续费', f(r.fut_fee)) +
+    row('净利润', f(r.net), valCls(r.net)) +
+    row('深度（手）', r.tradeable != null ? Number(r.tradeable).toPrecision(4) : '—') +
+    row('预期最大收益', r.expected_max != null ? f(r.expected_max) : '—', valCls(r.expected_max)) +
+  '</div>';
+
+  // 年化
+  html += `<div class="detail-section">${sec('年化')}` +
+    row('当前年化', fPct(r.ann_pct), valCls(r.ann_pct)) +
+    row('历史最大年化', fPct(r.hist_ann_pct)) +
+    row('历史最大持续', r.hist_duration_sec != null ? fmtDuration(r.hist_duration_sec) : '—') +
+  '</div>';
+
+  // 时间
+  html += `<div class="detail-section">${sec('时间')}` +
+    row('首次活跃', r.first_active ? fmtUnixSecLocal(r.first_active) : '—') +
+    row('最后活跃', fmtUnixSecLocal(r.last_active_eval)) +
+    row('持续时长', (() => {
+      if (r.active && r.first_active) return fmtDuration(Date.now()/1000 - r.first_active);
+      if (r.frozen_duration != null) return fmtDuration(r.frozen_duration);
+      return '—';
+    })()) +
+  '</div>';
+
+  document.getElementById('detail-body').innerHTML = html;
+  document.getElementById('detail-overlay').classList.add('open');
+}
+
+function closeDetail() {
+  document.getElementById('detail-overlay').classList.remove('open');
+}
+document.getElementById('detail-overlay')?.addEventListener('click', e => {
+  if (e.target === document.getElementById('detail-overlay')) closeDetail();
+});
+document.addEventListener('keydown', e => { if (e.key === 'Escape') closeDetail(); });
 </script>
 <div id="toast-container" style="position:fixed;bottom:24px;right:24px;z-index:9999;display:flex;flex-direction:column-reverse;gap:8px;max-width:360px;"></div>
+<div id="detail-overlay">
+  <div id="detail-modal">
+    <button id="detail-close" onclick="closeDetail()">✕</button>
+    <h3 id="detail-title"></h3>
+    <div id="detail-body"></div>
+  </div>
+</div>
 </body>
 </html>

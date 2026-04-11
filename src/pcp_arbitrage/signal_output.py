@@ -96,15 +96,22 @@ def _restore_opportunity_rows_from_db(
     try:
         from pcp_arbitrage.db import coalesce_per_leg_fees, init_db, load_opportunity_current
         from pcp_arbitrage.opportunity_dashboard import _Row
+
         init_db(sqlite_path)
         db_rows = load_opportunity_current(sqlite_path)
         if not db_rows:
             return
         import time
+
         now = time.time()
         for r in db_rows:
-            key = (r["exchange"], r["contract"].split("-")[0] if "-" in r["contract"] else "",
-                   "", 0.0, r["direction"])
+            key = (
+                r["exchange"],
+                r["contract"].split("-")[0] if "-" in r["contract"] else "",
+                "",
+                0.0,
+                r["direction"],
+            )
             # reconstruct key properly: (exchange, symbol, expiry, strike, direction)
             # label format: SYMBOL-EXPIRY-STRIKE
             parts = r["contract"].split("-")
@@ -126,8 +133,16 @@ def _restore_opportunity_rows_from_db(
                     first_active = now
                 frozen = None
             else:
-                first_active = now
                 frozen = float(dur_sec) if dur_sec is not None else None
+                # first_active 仅用于 fallback 计算，inactive 行无法精确还原；
+                # 若 DB 有 last_active_eval 可粗略推算（duration 未知时用 0）
+                last_ae = r.get("last_active_eval")
+                if last_ae is not None and frozen is not None:
+                    first_active = float(last_ae) - frozen
+                elif last_ae is not None:
+                    first_active = float(last_ae)
+                else:
+                    first_active = now
             cf, pf, ff = coalesce_per_leg_fees(
                 r["fee_usdt"],
                 r.get("call_fee_usdt"),
@@ -156,6 +171,7 @@ def _restore_opportunity_rows_from_db(
                 call_fee=cf,
                 put_fee=pf,
                 fut_fee=ff,
+                index_price_usdt=r.get("index_price_usdt"),
                 frozen_active_duration_sec=frozen,
                 active_session_id=None,
             )
@@ -213,10 +229,7 @@ def notify_monitoring_ready(exchange: str) -> None:
         _monitoring_ready_count,
         _monitoring_needed,
     )
-    if (
-        _dashboard_start_event is not None
-        and _monitoring_ready_count >= _monitoring_needed
-    ):
+    if _dashboard_start_event is not None and _monitoring_ready_count >= _monitoring_needed:
         _dashboard_start_event.set()
 
 
@@ -251,6 +264,7 @@ def register_dashboard_runner_meta(
         )
     if _cfg is not None and _cfg.sqlite_path and triplets is not None:
         from pcp_arbitrage.db import init_db, upsert_triplets
+
         try:
             init_db(_cfg.sqlite_path)
             upsert_triplets(_cfg.sqlite_path, exchange, triplets, settle_type)
@@ -320,6 +334,18 @@ def emit_opportunity_evaluation(
 
     if is_active:
         assert sig is not None
+        order_threshold = _cfg.order_min_annualized_rate if _cfg is not None else None
+        meets_order = order_threshold is not None and sig.annualized_return >= order_threshold
+        if not _notified_keys.get(notif_key, False):
+            logger.info(
+                "[%s %s %s] 年化 %.1f%%，下单阈值 %s，%s",
+                exchange,
+                _triplet_label(triplet),
+                direction,
+                sig.annualized_return * 100,
+                f"{order_threshold * 100:.1f}%" if order_threshold is not None else "未配置",
+                "触发下单 ✅" if meets_order else "未达下单阈值",
+            )
         if (
             _cfg is not None
             and sig.annualized_return >= _cfg.order_min_annualized_rate
@@ -338,16 +364,20 @@ def emit_opportunity_evaluation(
                 pass  # No running event loop (e.g., during testing without async context)
             try:
                 from pcp_arbitrage import web_dashboard as _wd
-                _wd.push_notification({
-                    "exchange": exchange,
-                    "label": label,
-                    "direction": direction_str,
-                    "ann_pct": round(sig.annualized_return * 100, 1),
-                    "net_profit": round(sig.net_profit, 2),
-                })
+
+                _wd.push_notification(
+                    {
+                        "exchange": exchange,
+                        "label": label,
+                        "direction": direction_str,
+                        "ann_pct": round(sig.annualized_return * 100, 1),
+                        "net_profit": round(sig.net_profit, 2),
+                    }
+                )
             except Exception:
                 pass
             from pcp_arbitrage import order_manager as _om
+
             try:
                 asyncio.create_task(
                     _om.submit_entry(triplet, sig, signal_id, _cfg, _cfg.sqlite_path)
@@ -401,9 +431,7 @@ def emit_triplet_if_books_ready(
             index_for_fee=index_for_fee,
             future_inverse_usd_face=future_inverse_usd_face,
         )
-        emit_opportunity_evaluation(
-            exchange, triplet, direction, sig, min_annualized_rate
-        )
+        emit_opportunity_evaluation(exchange, triplet, direction, sig, min_annualized_rate)
 
 
 async def run_startup_revalidation_loop() -> None:
@@ -430,6 +458,7 @@ async def run_opportunity_sqlite_loop() -> None:
     if _cfg is None or not _cfg.sqlite_path:
         return
     from pcp_arbitrage.db import init_db, upsert_opportunity_current
+
     init_db(_cfg.sqlite_path)
     while True:
         await asyncio.sleep(10)
@@ -445,6 +474,7 @@ async def run_triplet_db_refresh_loop() -> None:
     if _cfg is None or not _cfg.sqlite_path:
         return
     from pcp_arbitrage.db import upsert_triplets
+
     while True:
         now = datetime.datetime.now()
         tomorrow = (now + datetime.timedelta(days=1)).replace(

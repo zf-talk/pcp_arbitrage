@@ -741,9 +741,18 @@ class DeribitRunner:
             return
 
         async with DeribitRestClient(api_key=ex.api_key, secret=ex.secret_key) as rest:
-            # 1. 认证
+            # 1. 认证（带重试，防 Cloudflare 520 等临时错误）
             logger.info("[deribit] Authenticating...")
-            await rest._authenticate()
+            for attempt in range(5):
+                try:
+                    await rest._authenticate()
+                    break
+                except Exception as e:
+                    if attempt == 4:
+                        raise
+                    wait = 5 * (attempt + 1)
+                    logger.warning("[deribit] 认证失败（%s），%ds 后重试…", e, wait)
+                    await asyncio.sleep(wait)
 
             # 2. 费率
             logger.info("[deribit] Fetching fee rates...")

@@ -154,7 +154,7 @@ async def submit_entry(
     signal_id: int | None,
     cfg: "AppConfig",
     sqlite_path: str,
-) -> None:
+) -> tuple[bool, str]:
     """Submit a three-leg entry for a PCP arbitrage signal.
 
     1. Guard against duplicate open positions.
@@ -163,11 +163,14 @@ async def submit_entry(
     4. Poll for fill status.
     5. Update DB and send Telegram notification.
     Never raises — all exceptions are caught and logged.
+    Returns (ok, message).
     """
     try:
-        await _submit_entry_inner(triplet, signal, signal_id, cfg, sqlite_path)
+        msg = await _submit_entry_inner(triplet, signal, signal_id, cfg, sqlite_path)
+        return (True, msg or "下单成功")
     except Exception as exc:
         logger.exception("submit_entry failed: %s", exc)
+        return (False, str(exc))
 
 
 async def _submit_entry_inner(
@@ -176,12 +179,11 @@ async def _submit_entry_inner(
     signal_id: int | None,
     cfg: "AppConfig",
     sqlite_path: str,
-) -> None:
-    exchange_name = "OKX"
-    exc_cfg = cfg.exchanges.get(exchange_name)
+) -> str:
+    exchange_name = triplet.exchange if hasattr(triplet, "exchange") else "OKX"
+    exc_cfg = cfg.exchanges.get(exchange_name.upper()) or cfg.exchanges.get(exchange_name.lower())
     if exc_cfg is None:
-        logger.warning("submit_entry: OKX exchange not configured, skipping")
-        return
+        raise RuntimeError(f"{exchange_name} 未配置")
 
     # --- Guard: check for existing open position ---
     conn = sqlite3.connect(sqlite_path)
@@ -202,7 +204,7 @@ async def _submit_entry_inner(
                 triplet.expiry,
                 signal.direction,
             )
-            return
+            raise RuntimeError("已有持仓")
 
         # --- Create position record ---
         with conn:
@@ -292,7 +294,7 @@ async def _submit_entry_inner(
                 sqlite_path, position_id, order_ids_db, cfg, exchange_name, triplet, legs, session,
                 api_key, secret, passphrase, is_paper, exch_order_ids
             )
-            return
+            raise RuntimeError("下单超时，已取消")
 
         # Record exchange order IDs and check for errors
         submit_errors: list[str] = []
@@ -320,7 +322,7 @@ async def _submit_entry_inner(
                 sqlite_path, position_id, order_ids_db, cfg, exchange_name, triplet, legs, session,
                 api_key, secret, passphrase, is_paper, exch_order_ids
             )
-            return
+            raise RuntimeError("下单提交失败: " + "; ".join(submit_errors))
 
         # Store exchange order IDs in DB
         conn = sqlite3.connect(sqlite_path)
@@ -426,6 +428,10 @@ async def _submit_entry_inner(
         await _notifier.send_telegram(cfg.telegram, msg)
     except Exception as exc:
         logger.warning("submit_entry: telegram notification failed: %s", exc)
+
+    if not all_filled:
+        raise RuntimeError(f"部分腿未成交 (partial_failed)，仓位 ID: {position_id}")
+    return f"下单成功，仓位 ID: {position_id}，数量: {qty}"
 
 
 async def _mark_partial_failed(

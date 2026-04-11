@@ -1,6 +1,5 @@
 import logging
 import math
-import os
 import time
 from collections import defaultdict
 
@@ -130,7 +129,6 @@ def print_triplet_summary(
         now_ms=now_ms,
         min_days_to_expiry=min_days_to_expiry,
     )
-    print(text)
     if pairing_log_dir:
         write_pairing_log(pairing_log_dir, exchange, text)
 
@@ -155,11 +153,6 @@ class OKXRunner:
     async def run(self) -> None:
         ex = self._ex
         app = self._app
-
-        # Apply PAPER_TRADING env-var override
-        if os.environ.get("PAPER_TRADING", "").lower() == "true":
-            import dataclasses
-            ex = dataclasses.replace(ex, is_paper_trading=True)
 
         margin_type = ex.margin_type
         margin_label = "USD" if margin_type == "coin" else "USDT"

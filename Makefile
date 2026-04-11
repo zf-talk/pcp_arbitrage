@@ -22,8 +22,9 @@ install:
 run:
 	$(UV) run pcp-arbitrage
 
+# 开发模式：监听 src/ 目录，代码变更自动重启（需要 watchfiles）
 dev:
-	PAPER_TRADING=true $(UV) run pcp-arbitrage
+	$(UV) run watchfiles "$(UV) run pcp-arbitrage" src/
 
 lint:
 	$(UV) run ruff check src tests
@@ -60,8 +61,4 @@ status:
 	supervisorctl -c $(APP_CONF) status $(APP_NAME)
 
 log:
-	@echo "=== $(LOG_OUT)（最近 100 行；supervisor 下 logging 与 stdout 均在此文件）==="
-	@test -f $(LOG_OUT) && tail -n 100 $(LOG_OUT) || echo "(无此文件，可先 mkdir -p $(LOG_DIR) 并启动进程)"
-
-logf:
-	tail -f $(LOG_OUT)
+	tail -f data/logs/*

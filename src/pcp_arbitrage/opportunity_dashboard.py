@@ -31,7 +31,7 @@ class _RunnerMeta:
     future_taker_rate: float
     future_maker_rate: float
     n_triplets: int
-    settle_type: str = ""   # e.g. "币本位(USD)" / "U本位(USDT)" / "U本位(USDC)"
+    settle_type: str = ""  # e.g. "币本位(USD)" / "U本位(USDT)" / "U本位(USDC)"
     symbols: list[str] = None  # type: ignore[assignment]
     triplets: list = None  # type: ignore[assignment]
 
@@ -62,9 +62,11 @@ class _Row:
     call_px_usdt: float | None = None
     put_px_usdt: float | None = None
     fut_px_usdt: float | None = None
-    call_fee: float | None = None   # 单边 call 手续费 (USDT)
-    put_fee: float | None = None    # 单边 put 手续费 (USDT)
-    fut_fee: float | None = None    # 单边 future 手续费 (USDT)
+    call_fee: float | None = None  # 单边 call 手续费 (USDT)
+    put_fee: float | None = None  # 单边 put 手续费 (USDT)
+    fut_fee: float | None = None  # 单边 future 手续费 (USDT)
+    # 本行用于期权手续费名义等的标的指数价（USDT）；active 时随评估更新，inactive 后冻结不变
+    index_price_usdt: float | None = None
     # 最近一次从 active 变 inactive 时冻结的「持续活跃时长」（秒）；active 时为 None
     frozen_active_duration_sec: float | None = None
     # opportunity_sessions.id while active; None after close or before first persist
@@ -74,6 +76,7 @@ class _Row:
 @dataclass
 class _TripletSnap:
     """Per-triplet book snapshot + ann for web dashboard triplets table."""
+
     exchange: str
     symbol: str
     expiry: str
@@ -89,7 +92,7 @@ class _TripletSnap:
     put_ask: float | None = None
     fut_bid: float | None = None
     fut_ask: float | None = None
-    fwd_ann_pct: float | None = None   # None = no profitable signal
+    fwd_ann_pct: float | None = None  # None = no profitable signal
     rev_ann_pct: float | None = None
     updated_at: float = 0.0
 
@@ -189,9 +192,7 @@ class OpportunityDashboard:
     def note_startup_revalidate_key(self, key: tuple[str, str, str, float, str]) -> None:
         self._startup_revalidate_keys.add(key)
 
-    def clear_startup_revalidate_key(
-        self, exchange: str, triplet: Triplet, direction: str
-    ) -> None:
+    def clear_startup_revalidate_key(self, exchange: str, triplet: Triplet, direction: str) -> None:
         self._startup_revalidate_keys.discard(
             (exchange, triplet.symbol, triplet.expiry, triplet.strike, direction)
         )
@@ -238,15 +239,23 @@ class OpportunityDashboard:
                 continue
             if not all(math.isfinite(float(x)) for x in (cpx, ppx, fpx)):
                 continue
-            idx = self._index_prices.get(sym)
-            if idx is None or not math.isfinite(idx) or idx <= 0:
-                sk = row.strike
-                if sk is not None and math.isfinite(float(sk)) and float(sk) > 0:
-                    idx = float(sk)
-                else:
-                    continue
+            idx_stored = row.index_price_usdt
+            if (
+                idx_stored is not None
+                and math.isfinite(float(idx_stored))
+                and float(idx_stored) > 0
+            ):
+                idx = float(idx_stored)
             else:
-                idx = float(idx)
+                idx = self._index_prices.get(sym)
+                if idx is None or not math.isfinite(idx) or idx <= 0:
+                    sk = row.strike
+                    if sk is not None and math.isfinite(float(sk)) and float(sk) > 0:
+                        idx = float(sk)
+                    else:
+                        continue
+                else:
+                    idx = float(idx)
             dir_key = "forward" if row.direction_cn == "正向" else "reverse"
             fr = FeeRates(
                 option_taker_rate=meta.option_taker_rate,
@@ -254,9 +263,7 @@ class OpportunityDashboard:
                 future_taker_rate=meta.future_taker_rate,
                 future_maker_rate=meta.future_maker_rate,
             )
-            face = inverse_future_usd_face_for_exchange(
-                row.exchange, sym, meta.settle_type
-            )
+            face = inverse_future_usd_face_for_exchange(row.exchange, sym, meta.settle_type)
             triple = per_leg_fees_from_stored_leg_px(
                 dir_key,
                 float(cpx),
@@ -325,10 +332,7 @@ class OpportunityDashboard:
 
     def get_all_triplets(self) -> dict[str, tuple[list, str]]:
         """Return {exchange: (triplets, settle_type)} for all known runners."""
-        return {
-            ex: (list(m.triplets), m.settle_type)
-            for ex, m in self._runner_meta.items()
-        }
+        return {ex: (list(m.triplets), m.settle_type) for ex, m in self._runner_meta.items()}
 
     def get_triplet_snaps(self) -> list[_TripletSnap]:
         """Return live per-triplet snapshots for web dashboard."""
@@ -376,9 +380,11 @@ class OpportunityDashboard:
                 row.active_session_id = existing
                 return
 
-            started = datetime.datetime.fromtimestamp(
-                row.first_active, datetime.UTC
-            ).isoformat(timespec="milliseconds") + "Z"
+            started = (
+                datetime.datetime.fromtimestamp(row.first_active, datetime.UTC)
+                .strftime("%Y-%m-%dT%H:%M:%S.") +
+                f"{int(row.first_active * 1000) % 1000:03d}Z"
+            )
             row.active_session_id = insert_opportunity_session(
                 self._sqlite_path,
                 exchange=row.exchange,
@@ -398,9 +404,7 @@ class OpportunityDashboard:
         try:
             from pcp_arbitrage.db import close_opportunity_session
 
-            ended = datetime.datetime.utcfromtimestamp(now).isoformat(
-                timespec="milliseconds"
-            ) + "Z"
+            ended = datetime.datetime.utcfromtimestamp(now).isoformat(timespec="milliseconds") + "Z"
             close_opportunity_session(
                 self._sqlite_path,
                 sid,
@@ -508,6 +512,7 @@ class OpportunityDashboard:
                     call_fee=sig.call_fee,
                     put_fee=sig.put_fee,
                     fut_fee=sig.fut_fee,
+                    index_price_usdt=sig.index_for_fee_usdt,
                     frozen_active_duration_sec=None,
                 )
                 self._begin_opportunity_session(self._rows[key])
@@ -533,6 +538,7 @@ class OpportunityDashboard:
                 row.call_fee = sig.call_fee
                 row.put_fee = sig.put_fee
                 row.fut_fee = sig.fut_fee
+                row.index_price_usdt = sig.index_for_fee_usdt
                 if reactivated:
                     self._begin_opportunity_session(row)
             return
@@ -555,11 +561,7 @@ class OpportunityDashboard:
         ann = self._min_annualized_rate * 100
 
         # 第一行：时间和运行时长
-        lines.append(
-            Text.from_markup(
-                f"[dim]当前时间 {clock}    已运行 {up}[/]"
-            )
-        )
+        lines.append(Text.from_markup(f"[dim]当前时间 {clock}    已运行 {up}[/]"))
         # 第二行：空行
         lines.append(Text(""))
         # 第三行：配置参数
@@ -692,6 +694,7 @@ class OpportunityDashboard:
         )
         table.add_column("交易所", style="cyan", no_wrap=True)
         table.add_column("合约", min_width=16)
+        table.add_column("指数", justify="right")
         table.add_column("距离到期", justify="right")
         table.add_column("方向", justify="center")
         table.add_column("价差", justify="right")
@@ -711,9 +714,15 @@ class OpportunityDashboard:
                 status = Text("inactive", style="dim")
                 row_style = "dim"
 
+            idx_txt = (
+                f"{r.index_price_usdt:,.2f}"
+                if r.index_price_usdt is not None and math.isfinite(r.index_price_usdt)
+                else "—"
+            )
             table.add_row(
                 r.exchange,
                 r.label,
+                idx_txt,
                 _fmt_days_to_expiry(r.days_to_expiry),
                 r.direction_cn,
                 f"{r.gross:.2f}",
@@ -735,7 +744,7 @@ class OpportunityDashboard:
         rows = rows[: self._max_rows]
 
         header = (
-            f"{'交易所':<10} {'合约':<22} {'距离到期':>8} {'方向':^4} {'价差':>10} "
+            f"{'交易所':<10} {'合约':<22} {'指数':>12} {'距离到期':>8} {'方向':^4} {'价差':>10} "
             f"{'手续费':>8} {'净利':>10} {'可交易量':>10} "
             f"{'实时年化/时长':>18} {'最大年化/时长':>18} {'状态':<8}"
         )
@@ -755,8 +764,13 @@ class OpportunityDashboard:
             dte = _fmt_days_to_expiry(r.days_to_expiry)
             ann_live = _ann_dur_cell(r.ann_pct, dur)
             ann_max = _ann_dur_cell(r.max_ann_pct, dur)
+            idx_s = (
+                f"{r.index_price_usdt:>12.2f}"
+                if r.index_price_usdt is not None and math.isfinite(r.index_price_usdt)
+                else f"{'—':>12}"
+            )
             out.append(
-                f"{r.exchange:<10} {r.label:<22} {dte:>8} {r.direction_cn:^4} "
+                f"{r.exchange:<10} {r.label:<22} {idx_s} {dte:>8} {r.direction_cn:^4} "
                 f"{r.gross:>10.2f} {r.fee:>8.2f} {r.net:>10.2f} {r.tradeable:>10.4g} "
                 f"{ann_live:>18} {ann_max:>18} {st:<8}"
             )

@@ -30,6 +30,7 @@ def coalesce_per_leg_fees(
     总手续费满足 2×(C+P+F)。仅当「恰好缺一条腿」时用代数补全；不做三腿均分（避免 C=P=F 误导）。
     缺两条及以上或无法从 fee 推算时返回 (None,…)，前端只显示总手续费。
     """
+
     def _fin(x: float | None) -> bool:
         return x is not None and math.isfinite(float(x))
 
@@ -165,6 +166,7 @@ def init_db(path: str) -> None:
         _ensure_column(con, "opportunity_current", "call_fee_usdt", "REAL")
         _ensure_column(con, "opportunity_current", "put_fee_usdt", "REAL")
         _ensure_column(con, "opportunity_current", "fut_fee_usdt", "REAL")
+        _ensure_column(con, "opportunity_current", "index_price_usdt", "REAL")
         _ensure_column(con, "opportunity_sessions", "expected_max_usdt", "REAL")
         _ensure_column(con, "positions", "current_mark_usdt", "REAL")
         _ensure_column(con, "positions", "last_updated", "TEXT")
@@ -274,6 +276,7 @@ def upsert_opportunity_current(path: str, rows: "list[_Row]") -> None:
             r.call_fee,
             r.put_fee,
             r.fut_fee,
+            r.index_price_usdt,
         )
         for r in rows
     ]
@@ -285,8 +288,8 @@ def upsert_opportunity_current(path: str, rows: "list[_Row]") -> None:
                 "(exchange, contract, direction, updated_at, gross_usdt, fee_usdt, net_usdt, "
                 " tradeable, ann_pct, ann_pct_max, days_to_exp, active, duration_sec, "
                 " strike, call_px_usdt, put_px_usdt, fut_px_usdt, last_active_eval, expected_max_usdt, "
-                " call_fee_usdt, put_fee_usdt, fut_fee_usdt) "
-                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) "
+                " call_fee_usdt, put_fee_usdt, fut_fee_usdt, index_price_usdt) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) "
                 "ON CONFLICT(exchange, contract, direction) DO UPDATE SET "
                 "  updated_at=excluded.updated_at, gross_usdt=excluded.gross_usdt, "
                 "  fee_usdt=excluded.fee_usdt, net_usdt=excluded.net_usdt, "
@@ -298,7 +301,8 @@ def upsert_opportunity_current(path: str, rows: "list[_Row]") -> None:
                 "  last_active_eval=excluded.last_active_eval, "
                 "  expected_max_usdt=excluded.expected_max_usdt, "
                 "  call_fee_usdt=excluded.call_fee_usdt, put_fee_usdt=excluded.put_fee_usdt, "
-                "  fut_fee_usdt=excluded.fut_fee_usdt",
+                "  fut_fee_usdt=excluded.fut_fee_usdt, "
+                "  index_price_usdt=excluded.index_price_usdt",
                 data,
             )
     finally:
@@ -314,7 +318,7 @@ def load_opportunity_current(path: str) -> list[dict]:
             "SELECT exchange, contract, direction, updated_at, gross_usdt, fee_usdt, "
             "net_usdt, tradeable, ann_pct, ann_pct_max, days_to_exp, active, duration_sec, "
             "strike, call_px_usdt, put_px_usdt, fut_px_usdt, last_active_eval, expected_max_usdt, "
-            "call_fee_usdt, put_fee_usdt, fut_fee_usdt "
+            "call_fee_usdt, put_fee_usdt, fut_fee_usdt, index_price_usdt "
             "FROM opportunity_current"
         )
         return [dict(r) for r in cur.fetchall()]
@@ -393,9 +397,7 @@ def close_opportunity_session(
         con.close()
 
 
-def close_open_opportunity_sessions(
-    path: str, *, ended_utc: str | None = None
-) -> tuple[int, str]:
+def close_open_opportunity_sessions(path: str, *, ended_utc: str | None = None) -> tuple[int, str]:
     """Set ended_utc on any session still open (e.g. process restart).
 
     Returns (rows_updated, ended_utc_iso) so restore can reopen rows still active in opportunity_current.
@@ -469,6 +471,145 @@ def find_open_opportunity_session_id(
         con.close()
 
 
+def aggregate_opportunity_sessions_stats(path: str) -> dict[str, dict[str, float | int]]:
+    """Sum metrics from ``opportunity_sessions`` (not live snapshot).
+
+    - ``all``: only **closed** sessions with ``gross_usdt`` filled (typical completed signals).
+    - ``today``: among sessions whose **local start day** is today, each distinct opportunity
+      ``(exchange, contract, direction)`` is counted **once**; its contribution is
+      ``MAX(expected_max_usdt)`` that day (then summed per direction / overall).
+    """
+    out: dict[str, dict[str, float | int]] = {
+        "all": {
+            "closed_sessions": 0,
+            "avg_ann_pct": 0.0,
+            "max_ann_pct": 0.0,
+            "avg_duration_sec": 0.0,
+            "sum_expected_max": 0.0,
+        },
+        "today": {
+            "fwd_count": 0,
+            "rev_count": 0,
+            "total_count": 0,
+            "sum_max_fwd": 0.0,
+            "sum_max_rev": 0.0,
+            "sum_max_total": 0.0,
+        },
+    }
+    con = sqlite3.connect(path)
+    try:
+        cur = con.execute(
+            """
+            SELECT COUNT(*),
+                   COALESCE(AVG(ann_pct), 0),
+                   COALESCE(MAX(ann_pct), 0),
+                   COALESCE(AVG(duration_sec), 0),
+                   COALESCE(SUM(expected_max_usdt), 0)
+            FROM opportunity_sessions
+            WHERE ended_utc IS NOT NULL AND gross_usdt IS NOT NULL
+            """
+        )
+        row = cur.fetchone()
+        if row:
+            out["all"]["closed_sessions"] = int(row[0])
+            out["all"]["avg_ann_pct"] = float(row[1])
+            out["all"]["max_ann_pct"] = float(row[2])
+            out["all"]["avg_duration_sec"] = float(row[3])
+            out["all"]["sum_expected_max"] = float(row[4])
+
+        cur = con.execute(
+            """
+            SELECT direction,
+                   COUNT(*),
+                   COALESCE(SUM(mx), 0)
+            FROM (
+                SELECT exchange, contract, direction,
+                       MAX(COALESCE(expected_max_usdt, 0)) AS mx
+                FROM opportunity_sessions
+                WHERE date(replace(started_utc, '+00:00Z', 'Z'), 'localtime') = date('now', 'localtime')
+                GROUP BY exchange, contract, direction
+            ) AS u
+            GROUP BY direction
+            """
+        )
+        fwd_c, rev_c = 0, 0
+        fwd_m, rev_m = 0.0, 0.0
+        for r in cur.fetchall():
+            d, c, m = str(r[0]), int(r[1]), float(r[2])
+            if d == "正向":
+                fwd_c, fwd_m = c, m
+            elif d == "反向":
+                rev_c, rev_m = c, m
+        cur = con.execute(
+            """
+            SELECT COUNT(*), COALESCE(SUM(mx), 0)
+            FROM (
+                SELECT MAX(COALESCE(expected_max_usdt, 0)) AS mx
+                FROM opportunity_sessions
+                WHERE date(replace(started_utc, '+00:00Z', 'Z'), 'localtime') = date('now', 'localtime')
+                GROUP BY exchange, contract, direction
+            ) AS u
+            """
+        )
+        trow = cur.fetchone()
+        tot_c, tot_m = (int(trow[0]), float(trow[1])) if trow else (0, 0.0)
+        out["today"].update(
+            {
+                "fwd_count": fwd_c,
+                "rev_count": rev_c,
+                "total_count": tot_c,
+                "sum_max_fwd": fwd_m,
+                "sum_max_rev": rev_m,
+                "sum_max_total": tot_m,
+            }
+        )
+    finally:
+        con.close()
+    return out
+
+
+def daily_expected_max_series_local(path: str, *, days: int = 30) -> list[dict[str, float | str]]:
+    """Last ``days`` local calendar days (inclusive), one point per day.
+
+    Uses the **host OS timezone** (SQLite ``localtime``). For each day, only **distinct**
+    opportunities ``(exchange, contract, direction)`` that **started** that local day are
+    included; each contributes ``MAX(expected_max_usdt)`` among its rows that day, then
+    days are summed. Missing days are included with sum 0.
+    """
+    from datetime import datetime, timedelta
+
+    today = datetime.now().astimezone().date()
+    start = today - timedelta(days=days - 1)
+    start_s, end_s = start.isoformat(), today.isoformat()
+    con = sqlite3.connect(path)
+    try:
+        cur = con.execute(
+            """
+            SELECT d, COALESCE(SUM(mx), 0)
+            FROM (
+                SELECT date(replace(started_utc, '+00:00Z', 'Z'), 'localtime') AS d,
+                       exchange, contract, direction,
+                       MAX(COALESCE(expected_max_usdt, 0)) AS mx
+                FROM opportunity_sessions
+                WHERE date(replace(started_utc, '+00:00Z', 'Z'), 'localtime') >= ? AND date(replace(started_utc, '+00:00Z', 'Z'), 'localtime') <= ?
+                GROUP BY date(replace(started_utc, '+00:00Z', 'Z'), 'localtime'), exchange, contract, direction
+            ) AS u
+            GROUP BY d
+            """,
+            (start_s, end_s),
+        )
+        by_day = {str(row[0]): float(row[1]) for row in cur.fetchall()}
+    finally:
+        con.close()
+    out: list[dict[str, float | str]] = []
+    d = start
+    while d <= today:
+        ds = d.isoformat()
+        out.append({"day": ds, "sum_expected_max": by_day.get(ds, 0.0)})
+        d += timedelta(days=1)
+    return out
+
+
 def list_opportunity_sessions_history(path: str, *, limit: int = 500) -> list[dict]:
     """Open sessions first (ended_utc NULL), then closed rows by ended_utc desc.
 
@@ -492,7 +633,9 @@ def list_opportunity_sessions_history(path: str, *, limit: int = 500) -> list[di
         con.close()
 
 
-def history_peak_ann_session_by_key(path: str) -> dict[tuple[str, str, str], dict[str, float | None]]:
+def history_peak_ann_session_by_key(
+    path: str,
+) -> dict[tuple[str, str, str], dict[str, float | None]]:
     """Per (exchange, contract, direction), session with highest ``ann_pct`` in ``opportunity_sessions``.
 
     Tie-break: larger ``id``. Only rows with non-NULL ``ann_pct`` are considered (typically closed

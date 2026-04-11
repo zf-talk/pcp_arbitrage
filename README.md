@@ -4,6 +4,10 @@ A real-time Put-Call Parity (PCP) arbitrage signal monitor for crypto derivative
 
 [中文文档](README.zh.md)
 
+## Documentation
+
+- **[docs/README.md](docs/README.md)** — Documentation index: onboarding uses this README plus the primary files under `docs/`; **`docs/superpowers/` is optional archival material** (plans/spec drafts)—you do not need to open it to understand the project.
+
 ## How It Works
 
 Put-Call Parity states that for European options:

@@ -4,6 +4,10 @@
 
 [English](README.md)
 
+## 文档
+
+- **[docs/README.md](docs/README.md)** — 文档索引：**上手请读根目录本文件 + `docs/` 下主文档**；`docs/superpowers/` 为可选存档，不必进入即可掌握项目。
+
 ## 工作原理
 
 看跌-看涨平价公式（欧式期权）：

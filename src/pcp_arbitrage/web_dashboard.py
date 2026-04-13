@@ -93,7 +93,7 @@ def _fetch_opportunity_gross_fee_tradeable(
     contract: str,
     direction: str,
 ) -> tuple[float | None, float | None, float | None]:
-    """已结束的 session 或当前机会表中的价差 gross / 手续费 / 可交易深度（用于按仓位数量缩放）。"""
+    """已结束 session（有 gross）或 opportunity_current 的价差 / 手续费 / 深度，用于持仓价差按张数缩放。"""
     import sqlite3
 
     con = sqlite3.connect(path)
@@ -130,6 +130,43 @@ def _fetch_opportunity_gross_fee_tradeable(
     finally:
         con.close()
     return None, None, None
+
+
+def _fetch_linked_opportunity_session(
+    path: str, signal_id: int | None
+) -> dict[str, float | None]:
+    """持仓 signal_id 对应的历史机会会话：年化 ann_pct、净利 net_usdt（与机会表「净利润」同口径）等。"""
+    out: dict[str, float | None] = {
+        "ann_pct": None,
+        "net_usdt": None,
+        "tradeable": None,
+        "expected_max_usdt": None,
+    }
+    if signal_id is None:
+        return out
+    import sqlite3
+
+    con = sqlite3.connect(path)
+    try:
+        con.row_factory = sqlite3.Row
+        row = con.execute(
+            "SELECT ann_pct, net_usdt, tradeable, expected_max_usdt "
+            "FROM opportunity_sessions WHERE id=?",
+            (int(signal_id),),
+        ).fetchone()
+        if row is None:
+            return out
+        for key in ("ann_pct", "net_usdt", "tradeable", "expected_max_usdt"):
+            raw = row[key]
+            if raw is None:
+                continue
+            try:
+                out[key] = float(raw)
+            except (TypeError, ValueError):
+                pass
+    finally:
+        con.close()
+    return out
 
 
 def _fee_order_to_usdt(order: dict, index_usdt: float | None, symbol_upper: str) -> float | None:
@@ -547,12 +584,75 @@ async def run_web_dashboard_loop(
                 text=json.dumps({"ok": False, "error": result_msg}, ensure_ascii=False),
             )
 
+    async def _close_position_handler(request: web.Request) -> web.Response:
+        """手动一键平仓：接收 position_id，调用 submit_exit 同时平掉三腿。"""
+        if _app_cfg is None:
+            return web.Response(
+                content_type="application/json",
+                status=503,
+                text=json.dumps({"ok": False, "error": "服务未就绪"}, ensure_ascii=False),
+            )
+        sqlite_path_close = _app_cfg.sqlite_path
+        if not sqlite_path_close:
+            return web.Response(
+                content_type="application/json",
+                status=400,
+                text=json.dumps({"ok": False, "error": "未配置 sqlite_path"}, ensure_ascii=False),
+            )
+        try:
+            body = await request.json()
+            position_id = int(body["position_id"])
+        except Exception:
+            return web.Response(
+                content_type="application/json",
+                status=400,
+                text=json.dumps({"ok": False, "error": "参数错误，需要 position_id"}, ensure_ascii=False),
+            )
+        import sqlite3 as _sqlite3
+        conn = _sqlite3.connect(sqlite_path_close)
+        try:
+            conn.row_factory = _sqlite3.Row
+            row = conn.execute(
+                "SELECT id, exchange, symbol, expiry, strike, direction, status, "
+                "call_inst_id, put_inst_id, future_inst_id "
+                "FROM positions WHERE id=?",
+                (position_id,),
+            ).fetchone()
+        finally:
+            conn.close()
+        if row is None:
+            return web.Response(
+                content_type="application/json",
+                status=404,
+                text=json.dumps({"ok": False, "error": f"持仓 {position_id} 不存在"}, ensure_ascii=False),
+            )
+        if row["status"] != "open":
+            return web.Response(
+                content_type="application/json",
+                status=400,
+                text=json.dumps(
+                    {"ok": False, "error": f"持仓状态为 {row['status']}，只能平仓 open 状态的持仓"},
+                    ensure_ascii=False,
+                ),
+            )
+        position = dict(row)
+        from pcp_arbitrage import order_manager as _om
+        asyncio.create_task(_om.submit_exit(position, _app_cfg, sqlite_path_close))
+        return web.Response(
+            content_type="application/json",
+            text=json.dumps(
+                {"ok": True, "message": f"已提交平仓指令，持仓 {position_id} 三腿正在平仓"},
+                ensure_ascii=False,
+            ),
+        )
+
     app = web.Application()
     app.router.add_get("/", _index_handler)
     app.router.add_get("/ws-data", _ws_data_handler)
     app.router.add_get("/api/triplet-summary", _triplet_summary_handler)
     app.router.add_get("/api/opportunity-history", _opportunity_history_handler)
     app.router.add_post("/api/manual-entry", _manual_entry_handler)
+    app.router.add_post("/api/close-position", _close_position_handler)
 
     runner = web.AppRunner(app, access_log_format='%a "%r" %s %b')
     await runner.setup()
@@ -985,6 +1085,8 @@ def _build_payload(dash: "OpportunityDashboard", *, full: bool) -> dict:
             "total_spread_usdt": None,
             "total_fee_usdt": None,
             "total_float_profit_usdt": None,
+            "expected_ann_pct": None,
+            "expected_profit_usdt": None,
         }
         if sqlite_path_pos:
             try:
@@ -1031,7 +1133,8 @@ def _build_payload(dash: "OpportunityDashboard", *, full: bool) -> dict:
             f"{pos['symbol']}-{pos['expiry']}-"
             f"{format_strike_display(pos['symbol'], float(pos['strike']))}"
         )
-        gross_snap, _fee_snap, tradeable_snap = None, None, None
+        qty_min = _min_open_filled_contract_qty(open_orders)
+        gross_snap, tradeable_snap = None, None
         if sqlite_path_pos:
             gross_snap, _fee_snap, tradeable_snap = _fetch_opportunity_gross_fee_tradeable(
                 sqlite_path_pos,
@@ -1040,7 +1143,41 @@ def _build_payload(dash: "OpportunityDashboard", *, full: bool) -> dict:
                 contract_label,
                 str(pos.get("direction") or ""),
             )
-        qty_min = _min_open_filled_contract_qty(open_orders)
+            sess = _fetch_linked_opportunity_session(
+                sqlite_path_pos, pos.get("signal_id")
+            )
+            entry["expected_ann_pct"] = sess["ann_pct"]
+            net_u = sess["net_usdt"]
+            tr_s = sess["tradeable"]
+            em_s = sess["expected_max_usdt"]
+            # 预计收益：历史会话中的净利 net_usdt × 实际开仓张数（与机会表净利润同口径）
+            if net_u is not None and qty_min is not None:
+                try:
+                    entry["expected_profit_usdt"] = float(net_u) * float(qty_min)
+                except (TypeError, ValueError):
+                    entry["expected_profit_usdt"] = None
+            elif (
+                em_s is not None
+                and tr_s is not None
+                and tr_s > 0
+                and qty_min is not None
+            ):
+                try:
+                    entry["expected_profit_usdt"] = float(em_s) * (
+                        float(qty_min) / float(tr_s)
+                    )
+                except (TypeError, ValueError):
+                    entry["expected_profit_usdt"] = None
+            elif em_s is not None:
+                try:
+                    entry["expected_profit_usdt"] = float(em_s)
+                except (TypeError, ValueError):
+                    entry["expected_profit_usdt"] = None
+            elif net_u is not None and tr_s is not None:
+                try:
+                    entry["expected_profit_usdt"] = float(net_u) * float(tr_s)
+                except (TypeError, ValueError):
+                    entry["expected_profit_usdt"] = None
         entry["total_spread_usdt"] = _scaled_total_spread_usdt(
             gross_snap, tradeable_snap, qty_min
         )

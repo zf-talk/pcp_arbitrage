@@ -914,6 +914,7 @@ setInterval(checkAutoTheme, 60000);
 
 // ── Tabs ────────────────────────────────────────────────────────────────────
 let _lastPositions = [];
+let _lastPositionsJson = '';
 /** @type {Record<number, string>} */
 let _positionLastError = {};
 function _activateTab(panel) {
@@ -2050,7 +2051,7 @@ function renderPositions() {
       <td class="c">${escHtml(p.direction)}</td>
       <td class="r">${expAnnCell}</td>
       <td class="${epCls}">${epStr}</td>
-      <td>${escHtml(p.opened_at)}</td>
+      <td>${fmtUtcIsoToLocal(p.opened_at)}</td>
       <td class="c"><span class="pos-status-txt">${escHtml(p.status)}</span>${errBtn}</td>
       <td class="c">${closeBtn}</td>
     </tr>`;
@@ -2546,7 +2547,14 @@ function connectData() {
     if (msg.prices)    updatePriceBar(msg.prices);
     if (msg.start_ts)  updateUptime(msg.start_ts);
     if (msg.rows !== undefined) renderOppTable(msg.rows);
-    if (msg.positions !== undefined) { _lastPositions = msg.positions; renderPositions(); }
+    if (msg.positions !== undefined) {
+      const newJson = JSON.stringify(msg.positions);
+      if (newJson !== _lastPositionsJson) {
+        _lastPositionsJson = newJson;
+        _lastPositions = msg.positions;
+        renderPositions();
+      }
+    }
     if (msg.accounts !== undefined) { _lastAccounts = msg.accounts; renderAccounts(); }
     if (msg.leg_prices) updateLegPricesLive(msg.leg_prices);
   };

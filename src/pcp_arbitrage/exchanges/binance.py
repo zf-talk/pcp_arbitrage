@@ -314,6 +314,7 @@ class BinanceRunner:
                 now_ms=now_ms,
                 margin_type=margin_type,
                 min_days_to_expiry=app.min_days_to_expiry,
+                exchange="binance",
             )
             logger.info("[binance] Built %d triplets", len(triplets))
             settle_type = "U本位(USDT)" if margin_type == "usdt" else "币本位(USD)"

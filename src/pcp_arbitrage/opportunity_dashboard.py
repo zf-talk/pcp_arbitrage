@@ -439,7 +439,8 @@ class OpportunityDashboard:
         direction: str,
         sig: ArbitrageSignal | None,
         min_annualized_rate: float,
-    ) -> None:
+    ) -> int | None:
+        """Record one evaluation tick. Returns the active session id (or None)."""
         key = (exchange, triplet.symbol, triplet.expiry, triplet.strike, direction)
         tkey = (exchange, triplet.symbol, triplet.expiry, triplet.strike)
         now = time.time()
@@ -515,7 +516,8 @@ class OpportunityDashboard:
                     index_price_usdt=sig.index_for_fee_usdt,
                     frozen_active_duration_sec=None,
                 )
-                self._begin_opportunity_session(self._rows[key])
+                row = self._rows[key]
+                self._begin_opportunity_session(row)
             else:
                 reactivated = not row.active
                 if not row.active:
@@ -541,20 +543,21 @@ class OpportunityDashboard:
                 row.index_price_usdt = sig.index_for_fee_usdt
                 if reactivated:
                     self._begin_opportunity_session(row)
-            return
+            return row.active_session_id
 
         row = self._rows.get(key)
         if row is None:
-            return
+            return None
         was_active = row.active
         if not was_active:
             # Freeze row values while inactive; wait for next qualified tick.
-            return
+            return None
         row.last_eval = now
         row.frozen_active_duration_sec = now - row.first_active
         self._end_opportunity_session(row, now)
         row.active = False
         self._sync_current_row_now(row)
+        return None
 
     def _build_static_header(self, clock: str, up: str) -> RenderableType:
         lines: list[Text] = []

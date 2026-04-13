@@ -34,21 +34,31 @@ def _make_db() -> sqlite3.Connection:
             opened_at TEXT NOT NULL,
             closed_at TEXT,
             current_mark_usdt REAL,
-            last_updated TEXT
+            last_updated TEXT,
+            call_inst_id TEXT,
+            put_inst_id TEXT,
+            future_inst_id TEXT,
+            last_error TEXT
         );
         CREATE TABLE IF NOT EXISTS orders (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
+            signal_id INTEGER,
             position_id INTEGER NOT NULL REFERENCES positions(id),
+            inst_id TEXT,
             leg TEXT NOT NULL,
-            order_type TEXT NOT NULL,
+            action TEXT NOT NULL,
+            order_type TEXT NOT NULL DEFAULT 'limit',
             side TEXT NOT NULL,
             exchange_order_id TEXT,
             limit_px REAL NOT NULL,
             filled_px REAL,
+            filled_qty REAL,
             qty REAL NOT NULL,
             status TEXT NOT NULL DEFAULT 'pending',
             fee_type TEXT,
+            actual_fee REAL,
             actual_fee_usdt REAL,
+            fee_ccy TEXT,
             submitted_at TEXT NOT NULL,
             filled_at TEXT
         );
@@ -57,14 +67,15 @@ def _make_db() -> sqlite3.Connection:
     return conn
 
 
-def _make_triplet() -> Triplet:
+def _make_triplet(exchange: str = "okx") -> Triplet:
     return Triplet(
+        exchange=exchange,
         symbol="BTC",
         expiry="250425",
         strike=80000.0,
-        call_id="BTC-250425-80000-C",
-        put_id="BTC-250425-80000-P",
-        future_id="BTC-250425",
+        call_id="BTC-USD-250425-80000-C",
+        put_id="BTC-USD-250425-80000-P",
+        future_id="BTC-USD-250425",
     )
 
 
@@ -146,7 +157,7 @@ class TestDbHelpers:
             conn,
             position_id=pid,
             leg="call",
-            order_type="limit",
+            action="open",
             side="buy",
             limit_px=100.0,
             qty=2.0,
@@ -169,7 +180,7 @@ class TestDbHelpers:
             conn,
             position_id=pid,
             leg="call",
-            order_type="limit",
+            action="open",
             side="buy",
             limit_px=100.0,
             qty=2.0,
@@ -193,17 +204,31 @@ class TestDbHelpers:
             direction="reverse",
         )
         conn.commit()
-        _db.update_position_status(conn, pid, "partial_failed")
+        _db.update_position_status(
+            conn, pid, "partial_failed", last_error="test error 原因",
+        )
         conn.commit()
-        row = conn.execute("SELECT status FROM positions WHERE id=?", (pid,)).fetchone()
+        row = conn.execute(
+            "SELECT status, last_error FROM positions WHERE id=?",
+            (pid,),
+        ).fetchone()
         assert row[0] == "partial_failed"
+        assert row[1] == "test error 原因"
+        _db.update_position_status(conn, pid, "open")
+        conn.commit()
+        row2 = conn.execute(
+            "SELECT status, last_error FROM positions WHERE id=?",
+            (pid,),
+        ).fetchone()
+        assert row2[0] == "open"
+        assert row2[1] is None
 
     def test_has_open_position_false_initially(self):
         conn = _make_db()
         result = _db.has_open_position(conn, "OKX", "BTC", "250425", 80000.0, "forward")
         assert result is False
 
-    def test_has_open_position_true_after_create(self):
+    def test_has_open_position_false_while_opening(self):
         conn = _make_db()
         _db.create_position(
             conn,
@@ -215,8 +240,31 @@ class TestDbHelpers:
             direction="forward",
         )
         conn.commit()
-        result = _db.has_open_position(conn, "OKX", "BTC", "250425", 80000.0, "forward")
-        assert result is True
+        assert _db.has_open_position(conn, "OKX", "BTC", "250425", 80000.0, "forward") is False
+        assert (
+            _db.blocking_entry_status(conn, "OKX", "BTC", "250425", 80000.0, "forward")
+            == "opening"
+        )
+
+    def test_has_open_position_true_after_marked_open(self):
+        conn = _make_db()
+        pid = _db.create_position(
+            conn,
+            signal_id=None,
+            exchange="OKX",
+            symbol="BTC",
+            expiry="250425",
+            strike=80000.0,
+            direction="forward",
+        )
+        conn.commit()
+        _db.update_position_status(conn, pid, "open")
+        conn.commit()
+        assert _db.has_open_position(conn, "OKX", "BTC", "250425", 80000.0, "forward") is True
+        assert (
+            _db.blocking_entry_status(conn, "OKX", "BTC", "250425", 80000.0, "forward")
+            == "open"
+        )
 
     def test_has_open_position_different_direction_not_blocked(self):
         conn = _make_db()
@@ -250,6 +298,9 @@ class TestDbHelpers:
         conn.commit()
         result = _db.has_open_position(conn, "OKX", "BTC", "250425", 80000.0, "forward")
         assert result is False
+        assert (
+            _db.blocking_entry_status(conn, "OKX", "BTC", "250425", 80000.0, "forward") is None
+        )
 
     def test_get_open_positions_empty(self):
         conn = _make_db()
@@ -257,7 +308,7 @@ class TestDbHelpers:
 
     def test_get_open_positions_returns_open(self):
         conn = _make_db()
-        _db.create_position(
+        pid = _db.create_position(
             conn,
             signal_id=None,
             exchange="OKX",
@@ -266,6 +317,9 @@ class TestDbHelpers:
             strike=80000.0,
             direction="forward",
         )
+        conn.commit()
+        assert _db.get_open_positions(conn) == []
+        _db.update_position_status(conn, pid, "open")
         conn.commit()
         rows = _db.get_open_positions(conn)
         assert len(rows) == 1
@@ -364,7 +418,7 @@ class TestOrderManagerSubmitEntry:
         _db.create_position(
             conn,
             signal_id=None,
-            exchange="OKX",
+            exchange="okx",
             symbol=triplet.symbol,
             expiry=triplet.expiry,
             strike=triplet.strike,
@@ -580,3 +634,183 @@ class TestOrderManagerSubmitEntry:
         with patch("aiohttp.ClientSession") as mock_cls:
             await om.submit_entry(triplet, signal, None, cfg, db_path)
             mock_cls.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Tests for new behaviour introduced with exchange routing
+# ---------------------------------------------------------------------------
+
+class TestExchangeRouting:
+    """Tests for same-exchange-only routing and lot-size rounding."""
+
+    @pytest.mark.asyncio
+    async def test_unsupported_exchange_skips_silently(self, tmp_path):
+        """Exchanges not in _SUPPORTED_EXEC_EXCHANGES return without error and without DB writes."""
+        db_path = str(tmp_path / "test.db")
+        _db.init_db(db_path)
+
+        triplet = _make_triplet(exchange="binance")
+        signal = _make_signal(triplet)
+        cfg = _make_cfg()
+
+        from pcp_arbitrage import order_manager as om
+        ok, msg = await om.submit_entry(triplet, signal, None, cfg, db_path)
+
+        assert ok is False
+        assert "暂不支持" in msg
+
+        conn = sqlite3.connect(db_path)
+        count = conn.execute("SELECT COUNT(*) FROM positions").fetchone()[0]
+        conn.close()
+        assert count == 0
+
+    @pytest.mark.asyncio
+    async def test_deribit_routes_to_deribit_inner(self, tmp_path):
+        """triplet.exchange='deribit' calls _submit_entry_deribit_inner, not OKX."""
+        db_path = str(tmp_path / "test.db")
+        _db.init_db(db_path)
+
+        triplet = _make_triplet(exchange="deribit")
+        signal = _make_signal(triplet)
+        cfg = AppConfig(
+            exchanges={
+                "deribit": ExchangeConfig(
+                    name="deribit",
+                    enabled=True,
+                    margin_type="coin",
+                    api_key="deribit_key",
+                    secret_key="deribit_secret",
+                    passphrase="",
+                    is_paper_trading=False,
+                )
+            },
+            symbols=["BTC"],
+            min_annualized_rate=0.01,
+            order_min_annualized_rate=0.05,
+            atm_range=0.1,
+            min_days_to_expiry=1.0,
+            stale_threshold_ms=5000,
+            lot_size={"BTC": 0.1},
+            telegram=TelegramConfig(bot_token="", chat_id=""),
+            sqlite_path=db_path,
+        )
+
+        from pcp_arbitrage import order_manager as om
+
+        deribit_inner_called = []
+
+        async def mock_deribit_inner(triplet, signal, signal_id, cfg, sqlite_path):
+            deribit_inner_called.append(True)
+            return "下单成功，仓位 ID: 1，数量: 0.1"
+
+        with patch.object(om, "_submit_entry_deribit_inner", mock_deribit_inner), \
+             patch("aiohttp.ClientSession") as mock_okx_session:
+            await om.submit_entry(triplet, signal, None, cfg, db_path)
+
+        assert deribit_inner_called, "Deribit inner was not called"
+        mock_okx_session.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_okx_does_not_route_to_deribit(self, tmp_path):
+        """triplet.exchange='okx' never calls _submit_entry_deribit_inner."""
+        db_path = str(tmp_path / "test.db")
+        _db.init_db(db_path)
+
+        triplet = _make_triplet(exchange="okx")
+        signal = _make_signal(triplet)
+        cfg = _make_cfg()
+
+        from pcp_arbitrage import order_manager as om
+
+        deribit_called = []
+
+        async def mock_deribit_inner(*args, **kwargs):
+            deribit_called.append(True)
+            return "ok"
+
+        async def mock_place(*args, **kwargs):
+            return "oid_x"
+
+        async def mock_poll(*args, **kwargs):
+            return {"ordId": "oid_x", "state": "filled", "avgPx": "100.0", "px": "100.0"}
+
+        with patch.object(om, "_submit_entry_deribit_inner", mock_deribit_inner), \
+             patch.object(om, "_place_order", mock_place), \
+             patch.object(om, "_poll_order_fill", mock_poll), \
+             patch("aiohttp.ClientSession") as mock_cls:
+            mock_session_cm = MagicMock()
+            mock_session_cm.__aenter__ = AsyncMock(return_value=MagicMock())
+            mock_session_cm.__aexit__ = AsyncMock(return_value=False)
+            mock_cls.return_value = mock_session_cm
+
+            await om.submit_entry(triplet, signal, None, cfg, db_path)
+
+        assert not deribit_called
+
+    def test_lot_size_floor_rounding(self):
+        """tradeable_qty is floored to nearest lot_size multiple before submission."""
+        import math
+        lot_size = 0.1
+
+        # 0.35 → 0.3
+        qty = math.floor(0.35 / lot_size) * lot_size
+        assert abs(qty - 0.3) < 1e-9
+
+        # 0.19 → 0.1
+        qty = math.floor(0.19 / lot_size) * lot_size
+        assert abs(qty - 0.1) < 1e-9
+
+        # exactly 0.2 → 0.2 (no change)
+        qty = math.floor(0.2 / lot_size) * lot_size
+        assert abs(qty - 0.2) < 1e-9
+
+        # 0.09 → 0.0 (would be caught by the qty <= 0 guard)
+        qty = math.floor(0.09 / lot_size) * lot_size
+        assert qty == 0.0
+
+    @pytest.mark.asyncio
+    async def test_zero_qty_after_rounding_raises(self, tmp_path):
+        """submit_entry fails cleanly when tradeable_qty rounds down to zero."""
+        from dataclasses import replace as dc_replace
+
+        db_path = str(tmp_path / "test.db")
+        _db.init_db(db_path)
+
+        triplet = _make_triplet(exchange="okx")
+        signal = _make_signal(triplet)
+        # lot_size=0.01 in _make_cfg; 0.005 < 0.01 so floors to zero
+        signal = dc_replace(signal, tradeable_qty=0.005)
+        cfg = _make_cfg()
+
+        from pcp_arbitrage import order_manager as om
+        with patch("aiohttp.ClientSession"):
+            ok, msg = await om.submit_entry(triplet, signal, None, cfg, db_path)
+
+        assert ok is False
+        assert "零" in msg
+
+        # No position should have been created
+        conn = sqlite3.connect(db_path)
+        count = conn.execute("SELECT COUNT(*) FROM positions").fetchone()[0]
+        conn.close()
+        assert count == 0
+
+    def test_deribit_futures_amount_calculation(self):
+        """Deribit futures amount = round(qty * future_price / contract_size) * contract_size."""
+        from pcp_arbitrage.pcp_calculator import DERIBIT_INVERSE_FUT_USD_FACE
+        import math
+
+        # BTC: contract_size = 10 USD
+        contract_size = DERIBIT_INVERSE_FUT_USD_FACE["BTC"]
+        assert contract_size == 10.0
+
+        qty = 0.1          # BTC
+        future_price = 80000.0  # USD
+        fut_amount = round(qty * future_price / contract_size) * contract_size
+        # 0.1 BTC × 80000 USD = 8000 USD total; rounded to nearest 10 USD = 8000 USD
+        assert fut_amount == 8000.0
+
+        qty = 0.3
+        fut_amount = round(qty * future_price / contract_size) * contract_size
+        assert fut_amount == 24000.0
+

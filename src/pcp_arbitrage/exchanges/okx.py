@@ -211,6 +211,7 @@ class OKXRunner:
                 now_ms=now_ms,
                 margin_type=margin_type,
                 min_days_to_expiry=app.min_days_to_expiry,
+                exchange="okx",
             )
             logger.info("[okx] Built %d triplets", len(triplets))
             settle_type = "U本位(USDT)" if margin_type == "usdt" else "币本位(USD)"
@@ -292,6 +293,24 @@ class OKXRunner:
                 )
                 market.update(inst_id, snap)
                 update_dashboard_leg_price("okx", inst_id, snap.bid, snap.ask)
+
+                # Push real-time leg prices to position tracker / WS clients
+                from pcp_arbitrage import position_tracker as _pt
+                positions_cache = _pt.get_positions_cache()
+                leg_fields = {
+                    "call_inst_id":   "call",
+                    "put_inst_id":    "put",
+                    "future_inst_id": "future",
+                }
+                for pos in positions_cache:
+                    for field, leg in leg_fields.items():
+                        if pos.get(field) == inst_id:
+                            _pt.push_leg_price_ws(
+                                pos["id"], leg,
+                                {"bid1": snap.bid, "ask1": snap.ask,
+                                 "bid_sz": snap.bid_sz, "ask_sz": snap.ask_sz},
+                            )
+                            break
 
                 now_ms = int(time.time() * 1000)
                 for t in triplets:

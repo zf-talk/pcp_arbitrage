@@ -26,6 +26,7 @@ def build_triplets(
     now_ms: int,
     margin_type: str = "coin",
     min_days_to_expiry: float = 1.0,
+    exchange: str = "",
 ) -> list[Triplet]:
     """
     Build (call, put, future) triplets from raw API payloads (exchange-normalized format).
@@ -105,6 +106,7 @@ def build_triplets(
         put_opt = put_map[key]
         triplets.append(
             Triplet(
+                exchange=exchange,
                 symbol=sym,
                 expiry=exp,
                 strike=strike,

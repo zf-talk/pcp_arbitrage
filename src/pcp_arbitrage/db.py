@@ -138,21 +138,28 @@ def init_db(path: str) -> None:
                 current_mark_usdt REAL,
                 last_updated TEXT
             );
+            CREATE TABLE IF NOT EXISTS app_config (
+                key   TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            );
             CREATE TABLE IF NOT EXISTS orders (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                position_id INTEGER NOT NULL REFERENCES positions(id),
-                leg TEXT NOT NULL,
-                order_type TEXT NOT NULL,
-                side TEXT NOT NULL,
+                id                INTEGER PRIMARY KEY AUTOINCREMENT,
+                position_id       INTEGER NOT NULL REFERENCES positions(id),
+                signal_id         INTEGER,
+                inst_id           TEXT,
+                leg               TEXT NOT NULL,
+                action            TEXT NOT NULL,
+                order_type        TEXT NOT NULL DEFAULT 'limit',
+                side              TEXT NOT NULL,
+                qty               REAL NOT NULL,
+                limit_px          REAL NOT NULL,
+                status            TEXT NOT NULL DEFAULT 'pending',
                 exchange_order_id TEXT,
-                limit_px REAL NOT NULL,
-                filled_px REAL,
-                qty REAL NOT NULL,
-                status TEXT NOT NULL DEFAULT 'pending',
-                fee_type TEXT,
-                actual_fee_usdt REAL,
-                submitted_at TEXT NOT NULL,
-                filled_at TEXT
+                filled_px         REAL,
+                fee_type          TEXT,
+                actual_fee_usdt   REAL,
+                submitted_at      TEXT NOT NULL,
+                filled_at         TEXT
             );
         """)
         _ensure_column(con, "opportunity_snapshots", "duration_sec", "REAL")
@@ -170,6 +177,14 @@ def init_db(path: str) -> None:
         _ensure_column(con, "opportunity_sessions", "expected_max_usdt", "REAL")
         _ensure_column(con, "positions", "current_mark_usdt", "REAL")
         _ensure_column(con, "positions", "last_updated", "TEXT")
+        _ensure_column(con, "orders", "actual_fee_usdt", "REAL")
+        _ensure_column(con, "orders", "actual_fee", "REAL")
+        _ensure_column(con, "orders", "fee_ccy", "TEXT")
+        _ensure_column(con, "orders", "filled_qty", "REAL")
+        _ensure_column(con, "positions", "call_inst_id",   "TEXT")
+        _ensure_column(con, "positions", "put_inst_id",    "TEXT")
+        _ensure_column(con, "positions", "future_inst_id", "TEXT")
+        _ensure_column(con, "positions", "last_error", "TEXT")
         con.commit()
         # Backfill expected_max_usdt for rows where it is NULL
         con.execute(
@@ -179,6 +194,19 @@ def init_db(path: str) -> None:
         con.execute(
             "UPDATE opportunity_sessions SET expected_max_usdt = net_usdt * tradeable "
             "WHERE expected_max_usdt IS NULL AND tradeable IS NOT NULL AND tradeable != 0"
+        )
+        # Backfill call/put/future_inst_id for existing positions that have orders
+        con.execute(
+            """
+            UPDATE positions SET
+                call_inst_id   = (SELECT inst_id FROM orders
+                                   WHERE position_id=positions.id AND leg='call'   AND action='open' LIMIT 1),
+                put_inst_id    = (SELECT inst_id FROM orders
+                                   WHERE position_id=positions.id AND leg='put'    AND action='open' LIMIT 1),
+                future_inst_id = (SELECT inst_id FROM orders
+                                   WHERE position_id=positions.id AND leg='future' AND action='open' LIMIT 1)
+            WHERE call_inst_id IS NULL
+            """
         )
         con.commit()
     finally:
@@ -332,6 +360,16 @@ def _utc_now_iso() -> str:
     return datetime.datetime.utcnow().isoformat(timespec="milliseconds") + "Z"
 
 
+_POSITION_ERROR_MAX_LEN = 8000
+
+
+def _truncate_position_error(message: str, max_len: int = _POSITION_ERROR_MAX_LEN) -> str:
+    s = (message or "").strip()
+    if len(s) <= max_len:
+        return s
+    return s[: max_len - 24] + "\n…(已截断)"
+
+
 def insert_opportunity_session(
     path: str,
     *,
@@ -400,18 +438,58 @@ def close_opportunity_session(
 def close_open_opportunity_sessions(path: str, *, ended_utc: str | None = None) -> tuple[int, str]:
     """Set ended_utc on any session still open (e.g. process restart).
 
+    duration_sec is set to the last-known value from opportunity_current rather than NULL,
+    so crash-interrupted sessions retain their pre-crash duration (downtime excluded).
+
     Returns (rows_updated, ended_utc_iso) so restore can reopen rows still active in opportunity_current.
     """
     ended = ended_utc or _utc_now_iso()
     con = sqlite3.connect(path)
     try:
         with con:
-            cur = con.execute(
-                "UPDATE opportunity_sessions SET ended_utc=?, duration_sec=NULL "
-                "WHERE ended_utc IS NULL",
-                (ended,),
+            rows = con.execute(
+                "SELECT s.id, s.exchange, s.contract, s.direction "
+                "FROM opportunity_sessions s WHERE s.ended_utc IS NULL"
+            ).fetchall()
+            for sid, exchange, contract, direction in rows:
+                cur_row = con.execute(
+                    "SELECT duration_sec FROM opportunity_current "
+                    "WHERE exchange=? AND contract=? AND direction=?",
+                    (exchange, contract, direction),
+                ).fetchone()
+                last_known_dur = float(cur_row[0]) if cur_row and cur_row[0] is not None else None
+                con.execute(
+                    "UPDATE opportunity_sessions SET ended_utc=?, duration_sec=? WHERE id=?",
+                    (ended, last_known_dur, sid),
+                )
+            return len(rows), ended
+    finally:
+        con.close()
+
+
+def write_heartbeat(path: str, *, ts: str | None = None) -> None:
+    """Upsert the last-seen heartbeat timestamp into app_config (called every ~1 s)."""
+    now = ts or _utc_now_iso()
+    con = sqlite3.connect(path)
+    try:
+        with con:
+            con.execute(
+                "INSERT INTO app_config (key, value) VALUES ('last_seen_utc', ?)"
+                " ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                (now,),
             )
-            return int(cur.rowcount), ended
+    finally:
+        con.close()
+
+
+def read_last_heartbeat(path: str) -> str | None:
+    """Return the last heartbeat timestamp from app_config, or None if absent."""
+    con = sqlite3.connect(path)
+    try:
+        row = con.execute(
+            "SELECT value FROM app_config WHERE key='last_seen_utc'"
+        ).fetchone()
+        return row[0] if row else None
     finally:
         con.close()
 
@@ -690,14 +768,20 @@ def create_position(
     expiry: str,
     strike: float,
     direction: str,
+    call_inst_id: str | None = None,
+    put_inst_id: str | None = None,
+    future_inst_id: str | None = None,
     opened_at: str | None = None,
 ) -> int:
     """Insert a new position row and return its id."""
     opened = opened_at or _utc_now_iso()
     cur = conn.execute(
-        "INSERT INTO positions (signal_id, exchange, symbol, expiry, strike, direction, opened_at) "
-        "VALUES (?,?,?,?,?,?,?)",
-        (signal_id, exchange, symbol, expiry, strike, direction, opened),
+        "INSERT INTO positions "
+        "(signal_id, exchange, symbol, expiry, strike, direction, status, "
+        " call_inst_id, put_inst_id, future_inst_id, opened_at) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+        (signal_id, exchange, symbol, expiry, strike, direction, "opening",
+         call_inst_id, put_inst_id, future_inst_id, opened),
     )
     return int(cur.lastrowid)
 
@@ -705,9 +789,12 @@ def create_position(
 def create_order(
     conn: sqlite3.Connection,
     *,
+    signal_id: int | None = None,
     position_id: int,
+    inst_id: str | None = None,
     leg: str,
-    order_type: str,
+    action: str,
+    order_type: str = "limit",
     side: str,
     limit_px: float,
     qty: float,
@@ -718,9 +805,9 @@ def create_order(
     submitted = submitted_at or _utc_now_iso()
     cur = conn.execute(
         "INSERT INTO orders "
-        "(position_id, leg, order_type, side, limit_px, qty, submitted_at, exchange_order_id) "
-        "VALUES (?,?,?,?,?,?,?,?)",
-        (position_id, leg, order_type, side, limit_px, qty, submitted, exchange_order_id),
+        "(signal_id, position_id, inst_id, leg, action, order_type, side, limit_px, qty, submitted_at, exchange_order_id) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+        (signal_id, position_id, inst_id, leg, action, order_type, side, limit_px, qty, submitted, exchange_order_id),
     )
     return int(cur.lastrowid)
 
@@ -731,16 +818,26 @@ def update_order_status(
     status: str,
     *,
     filled_px: float | None = None,
+    filled_qty: float | None = None,
     fee_type: str | None = None,
-    actual_fee_usdt: float | None = None,
+    actual_fee: float | None = None,
+    fee_ccy: str | None = None,
     filled_at: str | None = None,
+    order_type: str | None = None,
 ) -> None:
     """Update mutable fields on an orders row."""
-    conn.execute(
-        "UPDATE orders SET status=?, filled_px=?, fee_type=?, actual_fee_usdt=?, filled_at=? "
-        "WHERE id=?",
-        (status, filled_px, fee_type, actual_fee_usdt, filled_at, order_id),
-    )
+    if order_type is not None:
+        conn.execute(
+            "UPDATE orders SET status=?, filled_px=?, filled_qty=?, fee_type=?, "
+            "actual_fee=?, fee_ccy=?, filled_at=?, order_type=? WHERE id=?",
+            (status, filled_px, filled_qty, fee_type, actual_fee, fee_ccy, filled_at, order_type, order_id),
+        )
+    else:
+        conn.execute(
+            "UPDATE orders SET status=?, filled_px=?, filled_qty=?, fee_type=?, "
+            "actual_fee=?, fee_ccy=?, filled_at=? WHERE id=?",
+            (status, filled_px, filled_qty, fee_type, actual_fee, fee_ccy, filled_at, order_id),
+        )
 
 
 def update_position_status(
@@ -750,12 +847,36 @@ def update_position_status(
     *,
     realized_pnl_usdt: float | None = None,
     closed_at: str | None = None,
+    last_error: str | None = None,
 ) -> None:
-    """Update mutable fields on a positions row."""
-    conn.execute(
-        "UPDATE positions SET status=?, realized_pnl_usdt=?, closed_at=? WHERE id=?",
-        (status, realized_pnl_usdt, closed_at, position_id),
-    )
+    """Update mutable fields on a positions row.
+
+    Clears last_error when status is open or closed. For partial_failed / failed,
+    pass last_error to persist the reason (shown in dashboard).
+    """
+    if status in ("open", "closed"):
+        conn.execute(
+            "UPDATE positions SET status=?, realized_pnl_usdt=?, closed_at=?, last_error=NULL "
+            "WHERE id=?",
+            (status, realized_pnl_usdt, closed_at, position_id),
+        )
+    elif last_error is not None:
+        conn.execute(
+            "UPDATE positions SET status=?, realized_pnl_usdt=?, closed_at=?, last_error=? "
+            "WHERE id=?",
+            (
+                status,
+                realized_pnl_usdt,
+                closed_at,
+                _truncate_position_error(last_error),
+                position_id,
+            ),
+        )
+    else:
+        conn.execute(
+            "UPDATE positions SET status=?, realized_pnl_usdt=?, closed_at=? WHERE id=?",
+            (status, realized_pnl_usdt, closed_at, position_id),
+        )
 
 
 def get_open_positions(conn: sqlite3.Connection) -> list[dict]:
@@ -763,8 +884,23 @@ def get_open_positions(conn: sqlite3.Connection) -> list[dict]:
     conn.row_factory = sqlite3.Row
     cur = conn.execute(
         "SELECT id, signal_id, exchange, symbol, expiry, strike, direction, "
-        "status, realized_pnl_usdt, opened_at, closed_at, current_mark_usdt, last_updated "
+        "status, realized_pnl_usdt, opened_at, closed_at, current_mark_usdt, last_updated, "
+        "call_inst_id, put_inst_id, future_inst_id, last_error "
         "FROM positions WHERE status='open'"
+    )
+    return [dict(r) for r in cur.fetchall()]
+
+
+def get_failed_positions(conn: sqlite3.Connection, limit: int = 50) -> list[dict]:
+    """Return recent positions with failed/partial_failed status, newest first."""
+    conn.row_factory = sqlite3.Row
+    cur = conn.execute(
+        "SELECT id, signal_id, exchange, symbol, expiry, strike, direction, "
+        "status, realized_pnl_usdt, opened_at, closed_at, current_mark_usdt, last_updated, "
+        "last_error "
+        "FROM positions WHERE status IN ('failed', 'partial_failed') "
+        "ORDER BY id DESC LIMIT ?",
+        (limit,),
     )
     return [dict(r) for r in cur.fetchall()]
 
@@ -777,7 +913,7 @@ def has_open_position(
     strike: float,
     direction: str,
 ) -> bool:
-    """Return True if there is already an open position for this key."""
+    """Return True if there is a filled live position (status='open') for this key."""
     cur = conn.execute(
         "SELECT 1 FROM positions "
         "WHERE exchange=? AND symbol=? AND expiry=? AND strike=? AND direction=? AND status='open' "
@@ -787,18 +923,40 @@ def has_open_position(
     return cur.fetchone() is not None
 
 
-def get_active_position_keys(path: str) -> set[tuple[str, str, str, float, str]]:
-    """Return a set of (exchange, symbol, expiry, strike, direction) for all non-terminal positions.
+def blocking_entry_status(
+    conn: sqlite3.Connection,
+    exchange: str,
+    symbol: str,
+    expiry: str,
+    strike: float,
+    direction: str,
+) -> str | None:
+    """If new entry should be skipped, return status ('open'|'opening'|'closing'); else None.
 
-    Non-terminal = status in ('open', 'pending', 'opening', 'closing', 'partial_failed').
-    Used by web dashboard to mark rows as already having a position.
+    partial_failed / failed / closed do not block (可重新下单).
+    """
+    cur = conn.execute(
+        "SELECT status FROM positions "
+        "WHERE exchange=? AND symbol=? AND expiry=? AND strike=? AND direction=? "
+        "AND status IN ('open', 'opening', 'closing') "
+        "ORDER BY id DESC LIMIT 1",
+        (exchange, symbol, expiry, strike, direction),
+    )
+    row = cur.fetchone()
+    return str(row[0]) if row else None
+
+
+def get_active_position_keys(path: str) -> set[tuple[str, str, str, float, str]]:
+    """Return keys that still occupy the opportunity (open / in-flight / 平仓中).
+
+    Excludes partial_failed so UI 与自动下单均可重试；不含 closed/failed。
     """
     try:
         conn = sqlite3.connect(path)
         try:
             cur = conn.execute(
                 "SELECT exchange, symbol, expiry, strike, direction FROM positions "
-                "WHERE status NOT IN ('closed', 'failed')"
+                "WHERE status IN ('open', 'opening', 'closing')"
             )
             return {(r[0], r[1], r[2], float(r[3]), r[4]) for r in cur.fetchall()}
         finally:
@@ -823,15 +981,29 @@ def update_position_mark(
 def get_position_orders(
     conn: sqlite3.Connection,
     position_id: int,
-    order_type: str = "entry",
+    action: str = "open",
 ) -> list[dict]:
-    """Return orders for a position filtered by order_type."""
+    """Return orders for a position filtered by action ('open' or 'close')."""
     conn.row_factory = sqlite3.Row
     cur = conn.execute(
-        "SELECT id, position_id, leg, order_type, side, exchange_order_id, "
-        "limit_px, filled_px, qty, status, fee_type, actual_fee_usdt, "
+        "SELECT id, position_id, inst_id, leg, action, order_type, side, exchange_order_id, "
+        "limit_px, filled_px, qty, filled_qty, status, fee_type, actual_fee_usdt, actual_fee, fee_ccy, "
         "submitted_at, filled_at "
-        "FROM orders WHERE position_id=? AND order_type=?",
-        (position_id, order_type),
+        "FROM orders WHERE position_id=? AND action=?",
+        (position_id, action),
     )
     return [dict(r) for r in cur.fetchall()]
+
+
+def get_session_ids_with_positions(path: str) -> dict[int, str]:
+    """Return {signal_id: position_status} for positions linked to opportunity sessions."""
+    con = sqlite3.connect(path)
+    try:
+        cur = con.execute(
+            "SELECT signal_id, status FROM positions WHERE signal_id IS NOT NULL"
+        )
+        return {row[0]: row[1] for row in cur.fetchall()}
+    except sqlite3.OperationalError:
+        return {}
+    finally:
+        con.close()

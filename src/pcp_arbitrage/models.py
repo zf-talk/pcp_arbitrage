@@ -31,6 +31,7 @@ class FeeRates:
 
 @dataclass(frozen=True)
 class Triplet:
+    exchange: str  # "okx", "deribit", "deribit_linear", "binance"
     symbol: str  # "BTC" or "ETH"
     expiry: str  # "250425"
     strike: float  # strike price in USDT

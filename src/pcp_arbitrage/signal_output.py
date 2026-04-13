@@ -6,6 +6,7 @@ import asyncio
 import datetime
 import logging
 import sys
+import time
 from typing import TYPE_CHECKING
 
 from pcp_arbitrage import notifier
@@ -34,6 +35,11 @@ _cfg: AppConfig | None = None
 # Key: (exchange, label, direction) -> bool (True = already notified this activation)
 _notified_keys: dict[tuple[str, str, str], bool] = {}
 
+# Tracks the monotonic time of the last info log per key.
+# Re-logs at most once per _LOG_COOLDOWN_SEC even if the signal briefly dips inactive between ticks.
+_LOG_COOLDOWN_SEC: float = 60.0
+_logged_key_times: dict[tuple[str, str, str], float] = {}
+
 _monitoring_needed: int = 0
 _monitoring_ready_count: int = 0
 _dashboard_start_event: asyncio.Event | None = None
@@ -47,10 +53,11 @@ def register_startup_market_sweep(fn: object) -> None:
 
 def configure_signal_output(cfg: AppConfig) -> None:
     """Call once after load_config. Dashboard is only used when signal_ui=dashboard and stdout is a TTY."""
-    global _dash, _mode, _cfg, _startup_market_sweeps, _notified_keys
+    global _dash, _mode, _cfg, _startup_market_sweeps, _notified_keys, _logged_key_times
     _cfg = cfg
     _startup_market_sweeps = []
     _notified_keys = {}
+    _logged_key_times = {}
     _mode = (cfg.signal_ui or "classic").strip().lower()
     if _mode not in ("classic", "dashboard"):
         _mode = "classic"
@@ -65,12 +72,24 @@ def configure_signal_output(cfg: AppConfig) -> None:
         sqlite_path = cfg.sqlite_path or None
         mass_close_ended_utc: str | None = None
         if sqlite_path:
-            from pcp_arbitrage.db import close_open_opportunity_sessions, init_db
+            from pcp_arbitrage.db import (
+                close_open_opportunity_sessions,
+                init_db,
+                read_last_heartbeat,
+            )
 
             init_db(sqlite_path)
-            closed, mass_close_ended_utc = close_open_opportunity_sessions(sqlite_path)
+            last_heartbeat = read_last_heartbeat(sqlite_path)
+            closed, mass_close_ended_utc = close_open_opportunity_sessions(
+                sqlite_path, ended_utc=last_heartbeat
+            )
             if closed:
-                logger.info("[db] Closed %d open opportunity_sessions from previous run", closed)
+                logger.info(
+                    "[db] Closed %d open opportunity_sessions from previous run"
+                    " (last heartbeat: %s)",
+                    closed,
+                    last_heartbeat or "unknown",
+                )
 
         _dash = OpportunityDashboard(
             max_rows=cfg.signal_dashboard_max_rows,
@@ -336,7 +355,20 @@ def emit_opportunity_evaluation(
         assert sig is not None
         order_threshold = _cfg.order_min_annualized_rate if _cfg is not None else None
         meets_order = order_threshold is not None and sig.annualized_return >= order_threshold
-        if not _notified_keys.get(notif_key, False):
+    # record_evaluation先于submit_entry，以便拿到session_id
+    if _dash is not None:
+        signal_id = _dash.record_evaluation(exchange, triplet, direction, sig, min_annualized_rate)
+        _dash.clear_startup_revalidate_key(exchange, triplet, direction)
+    else:
+        signal_id = None
+
+    if is_active:
+        assert sig is not None
+        order_threshold = _cfg.order_min_annualized_rate if _cfg is not None else None
+        meets_order = order_threshold is not None and sig.annualized_return >= order_threshold
+        now = time.monotonic()
+        last_logged = _logged_key_times.get(notif_key, 0.0)
+        if now - last_logged >= _LOG_COOLDOWN_SEC:
             logger.info(
                 "[%s %s %s] 年化 %.1f%%，下单阈值 %s，%s",
                 exchange,
@@ -346,6 +378,7 @@ def emit_opportunity_evaluation(
                 f"{order_threshold * 100:.1f}%" if order_threshold is not None else "未配置",
                 "触发下单 ✅" if meets_order else "未达下单阈值",
             )
+            _logged_key_times[notif_key] = now
         if (
             _cfg is not None
             and sig.annualized_return >= _cfg.order_min_annualized_rate
@@ -389,12 +422,9 @@ def emit_opportunity_evaluation(
     # we intentionally do NOT re-notify — this avoids alert spam for noisy signals.
     else:
         _notified_keys.pop(notif_key, None)
+        _logged_key_times.pop(notif_key, None)
 
-    if _dash is not None:
-        _dash.record_evaluation(exchange, triplet, direction, sig, min_annualized_rate)
-        _dash.clear_startup_revalidate_key(exchange, triplet, direction)
-        return
-    if _mode == "classic" and sig is not None and sig.annualized_return >= min_annualized_rate:
+    if _dash is None and _mode == "classic" and sig is not None and sig.annualized_return >= min_annualized_rate:
         print_signal(sig)
 
 
@@ -490,6 +520,21 @@ async def run_triplet_db_refresh_loop() -> None:
                 upsert_triplets(_cfg.sqlite_path, exchange, triplets, settle_type)
             except Exception as e:
                 logger.warning("[db] midnight upsert_triplets failed for %s: %s", exchange, e)
+
+
+async def run_heartbeat_loop() -> None:
+    """Write a heartbeat timestamp to DB every 1 s so crash recovery knows the last live time."""
+    if _cfg is None or not _cfg.sqlite_path:
+        return
+    from pcp_arbitrage.db import write_heartbeat
+
+    path = _cfg.sqlite_path
+    while True:
+        await asyncio.sleep(1)
+        try:
+            write_heartbeat(path)
+        except Exception as exc:
+            logger.debug("[db] heartbeat write failed: %s", exc)
 
 
 async def run_opportunity_csv_loop() -> None:

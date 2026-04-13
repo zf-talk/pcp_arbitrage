@@ -19,6 +19,9 @@ logger = logging.getLogger(__name__)
 # Module-level cache updated after each poll; consumed by web_dashboard
 _open_positions_cache: list[dict] = []
 
+# Per-position per-leg live prices: {pos_id: {"call": {"bid1": x, "ask1": x}, ...}}
+_leg_prices_cache: dict[int, dict] = {}
+
 
 def update_positions_cache(positions: list[dict]) -> None:
     """Update the module-level positions cache (called by _check_positions after each poll)."""
@@ -29,6 +32,26 @@ def update_positions_cache(positions: list[dict]) -> None:
 def get_positions_cache() -> list[dict]:
     """Return a copy of the current positions cache."""
     return list(_open_positions_cache)
+
+
+def get_leg_prices_cache() -> dict:
+    """Return a copy of the per-position leg prices cache (bid1/ask1)."""
+    return dict(_leg_prices_cache)
+
+
+def push_leg_price_ws(pos_id: int, leg: str, update: dict) -> None:
+    """Update _leg_prices_cache for a single leg and push to web dashboard WS clients."""
+    if pos_id not in _leg_prices_cache:
+        _leg_prices_cache[pos_id] = {}
+    existing = _leg_prices_cache[pos_id].get(leg, {})
+    existing.update(update)
+    _leg_prices_cache[pos_id][leg] = existing
+    # Notify web dashboard to push a leg_prices patch to WS clients
+    try:
+        from pcp_arbitrage import web_dashboard as _wd
+        _wd.push_leg_prices_patch({pos_id: {leg: dict(existing)}})
+    except Exception:
+        pass
 
 
 async def run_position_tracker_loop(cfg: AppConfig) -> None:
@@ -45,7 +68,12 @@ async def _fetch_mark_price(
 ) -> float | None:
     """Fetch mark price from OKX public endpoint. Returns None on any error."""
     url = "https://www.okx.com/api/v5/market/mark-price"
-    params = {"instId": inst_id}
+    # OKX requires instType to correctly query options vs futures
+    if inst_id.endswith("-C") or inst_id.endswith("-P"):
+        inst_type = "OPTION"
+    else:
+        inst_type = "FUTURES"
+    params = {"instId": inst_id, "instType": inst_type}
     try:
         async with session.get(
             url,
@@ -60,9 +88,45 @@ async def _fetch_mark_price(
             items = data.get("data", [])
             if not items:
                 return None
-            return float(items[0].get("markPx", 0) or 0) or None
+            val = float(items[0].get("markPx", 0) or 0)
+            return val if val > 0 else None
     except Exception as exc:
         logger.debug("[position_tracker] mark-price error for %s: %s", inst_id, exc)
+        return None
+
+
+async def _fetch_ticker(
+    session: aiohttp.ClientSession,
+    inst_id: str,
+    proxy: str | None = None,
+) -> dict | None:
+    """Fetch bid1/ask1/bid_sz/ask_sz from OKX ticker endpoint."""
+    url = "https://www.okx.com/api/v5/market/ticker"
+    params = {"instId": inst_id}
+    try:
+        async with session.get(
+            url,
+            params=params,
+            proxy=proxy,
+            timeout=aiohttp.ClientTimeout(total=10),
+        ) as resp:
+            if resp.status != 200:
+                logger.debug("[position_tracker] ticker HTTP %d for %s", resp.status, inst_id)
+                return None
+            data = await resp.json()
+            items = data.get("data", [])
+            if not items:
+                return None
+            item = items[0]
+            bid1 = float(item.get("bidPx") or 0) or None
+            ask1 = float(item.get("askPx") or 0) or None
+            if bid1 is None and ask1 is None:
+                return None
+            bid_sz = float(item.get("bidSz") or 0) or None
+            ask_sz = float(item.get("askSz") or 0) or None
+            return {"bid1": bid1, "ask1": ask1, "bid_sz": bid_sz, "ask_sz": ask_sz}
+    except Exception as exc:
+        logger.debug("[position_tracker] ticker error for %s: %s", inst_id, exc)
         return None
 
 
@@ -217,6 +281,36 @@ async def _check_positions(cfg: AppConfig) -> None:
                     asyncio.create_task(
                         order_manager.submit_exit(pos_dict, cfg, cfg.sqlite_path)
                     )
+
+        # Fetch live bid1/ask1/bid_sz/ask_sz/mark_price for each leg of each open position
+        for pos in updated_positions:
+            pos_id = pos["id"]
+            leg_map: dict[str, str | None] = {
+                "call":   pos.get("call_inst_id"),
+                "put":    pos.get("put_inst_id"),
+                "future": pos.get("future_inst_id"),
+            }
+            if not any(leg_map.values()):
+                continue
+            active_legs = [(leg, iid) for leg, iid in leg_map.items() if iid]
+            # Concurrently fetch ticker + mark_price for each leg
+            ticker_coros = [_fetch_ticker(session, iid, proxy=cfg.proxy) for _, iid in active_legs]
+            mark_coros   = [_fetch_mark_price(session, iid, proxy=cfg.proxy) for _, iid in active_legs]
+            all_results = await asyncio.gather(*ticker_coros, *mark_coros, return_exceptions=True)
+            n = len(active_legs)
+            ticker_results = all_results[:n]
+            mark_results   = all_results[n:]
+            pos_prices: dict[str, dict] = {}
+            for (leg, _), ticker, mark_px in zip(active_legs, ticker_results, mark_results):
+                entry: dict = {}
+                if isinstance(ticker, dict):
+                    entry.update(ticker)
+                if isinstance(mark_px, float):
+                    entry["mark_price"] = mark_px
+                if entry:
+                    pos_prices[leg] = entry
+            if pos_prices:
+                _leg_prices_cache[pos_id] = pos_prices
 
     update_positions_cache(updated_positions)
     # Also update the web dashboard positions cache if the module is available

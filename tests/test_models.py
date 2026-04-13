@@ -23,6 +23,7 @@ def test_fee_rates_fields():
 
 def test_triplet_fields():
     t = Triplet(
+        exchange="okx",
         symbol="BTC",
         expiry="250425",
         strike=95000.0,
@@ -30,6 +31,7 @@ def test_triplet_fields():
         put_id="BTC-USD-250425-95000-P",
         future_id="BTC-USD-250425",
     )
+    assert t.exchange == "okx"
     assert t.symbol == "BTC"
     assert t.expiry == "250425"
     assert t.strike == 95000.0

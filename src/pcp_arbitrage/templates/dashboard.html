@@ -675,6 +675,13 @@
   }
   .pos-close-btn:hover:not(:disabled) { background: var(--red); color: #fff; }
   .pos-close-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+  .pos-retry-btn {
+    padding: 2px 8px; font-size: 12px; border-radius: 4px; cursor: pointer;
+    border: 1px solid var(--accent2); background: transparent; color: var(--accent2);
+    transition: background 0.15s, color 0.15s; margin-left: 4px;
+  }
+  .pos-retry-btn:hover:not(:disabled) { background: var(--accent2); color: #fff; }
+  .pos-retry-btn:disabled { opacity: 0.5; cursor: not-allowed; }
 </style>
 </head>
 <body>
@@ -1997,6 +2004,33 @@ async function closePosition(posId, btn) {
   }
 }
 
+async function retryExit(posId, btn) {
+  if (!confirm(`确认重试平仓？持仓 #${posId} 中失败的腿将重新下单。`)) return;
+  btn.disabled = true;
+  btn.textContent = '重试中…';
+  try {
+    const resp = await fetch('/api/retry-exit', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({position_id: posId}),
+    });
+    const data = await resp.json();
+    if (data.ok) {
+      btn.textContent = '已成功';
+      btn.style.borderColor = 'var(--green)';
+      btn.style.color = 'var(--green)';
+    } else {
+      btn.disabled = false;
+      btn.textContent = '重试平仓';
+      alert('重试失败：' + (data.error || data.message || '未知错误'));
+    }
+  } catch (e) {
+    btn.disabled = false;
+    btn.textContent = '重试平仓';
+    alert('请求失败：' + e.message);
+  }
+}
+
 function showPositionError(posId, ev) {
   if (ev) ev.stopPropagation();
   const text = _positionLastError[posId] || '';
@@ -2041,6 +2075,9 @@ function renderPositions() {
     const closeBtn = p.status === 'open'
       ? `<button type="button" class="pos-close-btn" title="一键平仓（同时平掉三腿）" onclick="closePosition(${p.id},this)">平仓</button>`
       : '';
+    const retryBtn = p.status === 'partial_failed'
+      ? `<button type="button" class="pos-retry-btn" title="重试失败腿平仓" onclick="retryExit(${p.id},this)">重试平仓</button>`
+      : '';
     html += `<tr data-pos-id="${p.id}">
       <td class="c" style="width:24px">${toggleBtn}</td>
       <td class="r">${escHtml(String(p.id))}</td>
@@ -2053,7 +2090,7 @@ function renderPositions() {
       <td class="${epCls}">${epStr}</td>
       <td>${fmtUtcIsoToLocal(p.opened_at)}</td>
       <td class="c"><span class="pos-status-txt">${escHtml(p.status)}</span>${errBtn}</td>
-      <td class="c">${closeBtn}</td>
+      <td class="c">${closeBtn}${retryBtn}</td>
     </tr>`;
     if (hasOrders) {
       html += `<tr class="pos-orders-row" id="pos-orders-${p.id}"><td colspan="12">` +

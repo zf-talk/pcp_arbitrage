@@ -159,7 +159,131 @@ async def _cancel_order(
         logger.warning("cancel_order failed inst=%s ord=%s: %s", inst_id, ord_id, exc)
 
 
-_OKX_EXEC_EXCHANGES = {"okx"}
+async def _noop_fill() -> None:
+    """Placeholder coroutine for skipped poll slots."""
+    return None
+
+
+async def _submit_and_poll_exit_legs_okx(
+    *,
+    legs: list[dict],
+    qty: float,
+    position_id: int,
+    signal_id: int | None,
+    leg_map: dict,
+    api_key: str,
+    secret: str,
+    passphrase: str,
+    is_paper: bool,
+    sqlite_path: str,
+) -> tuple[bool, float]:
+    """Create orders, submit, poll for fills, update DB per-leg.
+
+    Returns (all_filled, pnl_for_these_legs).
+    Used by both the auto-retry path and the manual retry endpoint.
+    """
+    # Create DB records for the legs
+    conn = sqlite3.connect(sqlite_path)
+    db_ids: list[int] = []
+    try:
+        with conn:
+            for leg in legs:
+                oid = _db.create_order(
+                    conn, signal_id=signal_id, position_id=position_id,
+                    inst_id=leg["inst_id"], leg=leg["leg"], action="close",
+                    side=leg["side"], limit_px=leg["px"], qty=qty,
+                )
+                db_ids.append(oid)
+    finally:
+        conn.close()
+
+    async with aiohttp.ClientSession(base_url=_OKX_REST_BASE) as sess:
+        # Submit
+        exch_ids: list[str | None] = [None] * len(legs)
+        try:
+            submit_results = await asyncio.wait_for(
+                asyncio.gather(
+                    *[_place_order(
+                        sess, inst_id=leg["inst_id"], td_mode="cross",
+                        side=leg["side"], ord_type="limit", px=leg["px"],
+                        sz=qty, api_key=api_key, secret=secret,
+                        passphrase=passphrase, is_paper=is_paper,
+                    ) for leg in legs],
+                    return_exceptions=True,
+                ),
+                timeout=_SUBMIT_TIMEOUT_SEC,
+            )
+        except asyncio.TimeoutError:
+            logger.error("[exit_legs] submit timed out pos=%d legs=%s",
+                         position_id, [l["leg"] for l in legs])
+            conn = sqlite3.connect(sqlite_path)
+            try:
+                with conn:
+                    for oid in db_ids:
+                        _db.update_order_status(conn, oid, "failed")
+            finally:
+                conn.close()
+            return False, 0.0
+
+        for i, r in enumerate(submit_results):
+            if not isinstance(r, Exception):
+                exch_ids[i] = r
+
+        # Store exchange IDs
+        conn = sqlite3.connect(sqlite_path)
+        try:
+            with conn:
+                for i, oid in enumerate(db_ids):
+                    if exch_ids[i]:
+                        conn.execute("UPDATE orders SET exchange_order_id=? WHERE id=?",
+                                     (exch_ids[i], oid))
+        finally:
+            conn.close()
+
+        # Poll fills (use _noop_fill for legs whose submission failed)
+        fill_results = await asyncio.gather(
+            *[_poll_order_fill(sess, inst_id=legs[i]["inst_id"], ord_id=exch_ids[i],
+                               api_key=api_key, secret=secret,
+                               passphrase=passphrase, is_paper=is_paper)
+              if exch_ids[i] else _noop_fill()
+              for i in range(len(legs))],
+            return_exceptions=True,
+        )
+
+    # Per-leg DB update + PnL accumulation
+    all_filled = True
+    pnl = 0.0
+    conn = sqlite3.connect(sqlite_path)
+    try:
+        with conn:
+            for i, oid in enumerate(db_ids):
+                fr = fill_results[i]
+                fd = fr if (not isinstance(fr, Exception) and fr is not None) else None
+                if fd is not None:
+                    _fee, _ccy = _okx_fee(fd)
+                    _db.update_order_status(
+                        conn, oid, "filled",
+                        filled_px=float(fd.get("avgPx") or fd.get("px") or 0),
+                        fee_type=_okx_fee_type(fd), actual_fee=_fee, fee_ccy=_ccy,
+                        filled_at=_db._utc_now_iso(),
+                    )
+                    leg = legs[i]
+                    exit_px = float(fd.get("avgPx") or fd.get("px") or leg["px"])
+                    entry_o = leg_map.get(leg["leg"])
+                    entry_px = float(
+                        entry_o.get("filled_px") or entry_o.get("limit_px") or 0.0
+                    ) if entry_o else 0.0
+                    if leg["side"] == "sell":
+                        pnl += (exit_px - entry_px) * qty
+                    else:
+                        pnl += (entry_px - exit_px) * qty
+                else:
+                    all_filled = False
+                    _db.update_order_status(conn, oid, "failed")
+    finally:
+        conn.close()
+
+    return all_filled, pnl
 _SUPPORTED_EXEC_EXCHANGES = {"okx", "deribit"}
 
 
@@ -960,6 +1084,97 @@ async def _fetch_order_book_top(
         return None, None
 
 
+async def retry_exit_position(
+    position: dict,
+    cfg: "AppConfig",
+    sqlite_path: str,
+) -> tuple[bool, str]:
+    """手动重试：对 partial_failed 仓位中 status='failed' 的平仓腿重新下单。"""
+    exchange = str(position.get("exchange", "")).lower()
+    if exchange not in _OKX_EXEC_EXCHANGES:
+        return False, f"暂不支持 {exchange} 的手动重试平仓"
+
+    position_id = position["id"]
+    exc_cfg = cfg.exchanges.get(exchange.upper()) or cfg.exchanges.get(exchange)
+    if exc_cfg is None:
+        return False, f"{exchange} 未配置"
+
+    # Find failed close orders and entry orders for PnL
+    conn = sqlite3.connect(sqlite_path)
+    try:
+        conn.row_factory = sqlite3.Row
+        failed_orders = [dict(r) for r in conn.execute(
+            "SELECT leg, inst_id, side, qty FROM orders "
+            "WHERE position_id=? AND action='close' AND status='failed' ORDER BY id",
+            (position_id,),
+        ).fetchall()]
+        entry_orders = [dict(r) for r in conn.execute(
+            "SELECT leg, limit_px, filled_px FROM orders "
+            "WHERE position_id=? AND action='open'",
+            (position_id,),
+        ).fetchall()]
+    finally:
+        conn.close()
+
+    if not failed_orders:
+        return False, "没有找到需要重试的失败平仓单"
+
+    qty = float(failed_orders[0].get("qty") or 1.0)
+    leg_map = {o["leg"]: o for o in entry_orders}
+    api_key = exc_cfg.api_key
+    secret = exc_cfg.secret_key
+    passphrase = exc_cfg.passphrase
+    is_paper = exc_cfg.is_paper_trading
+
+    # Fetch fresh passive prices
+    async with aiohttp.ClientSession(base_url=_OKX_REST_BASE) as sess:
+        book_results = await asyncio.gather(
+            *[_fetch_order_book_top(sess, o["inst_id"], api_key=api_key,
+                                   secret=secret, passphrase=passphrase, is_paper=is_paper)
+              for o in failed_orders],
+            return_exceptions=True,
+        )
+
+    retry_legs = []
+    for i, o in enumerate(failed_orders):
+        book = book_results[i]
+        if isinstance(book, Exception) or book == (None, None):
+            return False, f"无法获取 {o['inst_id']} 盘口数据，请稍后重试"
+        bid, ask = book
+        px = bid if o["side"] == "buy" else ask  # passive maker
+        retry_legs.append({"inst_id": o["inst_id"], "side": o["side"],
+                           "leg": o["leg"], "px": px})
+
+    all_filled, pnl = await _submit_and_poll_exit_legs_okx(
+        legs=retry_legs, qty=qty, position_id=position_id,
+        signal_id=position.get("signal_id"), leg_map=leg_map,
+        api_key=api_key, secret=secret, passphrase=passphrase, is_paper=is_paper,
+        sqlite_path=sqlite_path,
+    )
+
+    # Update position status
+    conn = sqlite3.connect(sqlite_path)
+    try:
+        with conn:
+            if all_filled:
+                existing = conn.execute(
+                    "SELECT realized_pnl_usdt FROM positions WHERE id=?", (position_id,)
+                ).fetchone()
+                existing_pnl = float(existing[0] or 0) if existing else 0.0
+                _db.update_position_status(conn, position_id, "closed",
+                                           realized_pnl_usdt=existing_pnl + pnl,
+                                           closed_at=_db._utc_now_iso())
+            else:
+                _db.update_position_status(conn, position_id, "partial_failed",
+                                           last_error="手动重试后仍有平仓单未成交")
+    finally:
+        conn.close()
+
+    if all_filled:
+        return True, "重试平仓成功，仓位已全部平仓"
+    return False, "重试后仍有平仓单未成交，请查看订单详情"
+
+
 async def submit_exit(
     position: dict,
     cfg: "AppConfig",
@@ -1200,7 +1415,7 @@ async def _submit_exit_inner(
         else:
             filled_data.append(fr)
 
-    # --- Always update each order's status individually (filled or failed) ---
+    # --- Per-leg DB update (filled or failed), accumulate PnL ---
     realized_pnl = 0.0
     conn = sqlite3.connect(sqlite_path)
     try:
@@ -1210,16 +1425,11 @@ async def _submit_exit_inner(
                 if fd is not None:
                     _fee, _ccy = _okx_fee(fd)
                     _db.update_order_status(
-                        conn,
-                        oid_db,
-                        "filled",
+                        conn, oid_db, "filled",
                         filled_px=float(fd.get("avgPx") or fd.get("px") or 0),
-                        fee_type=_okx_fee_type(fd),
-                        actual_fee=_fee,
-                        fee_ccy=_ccy,
+                        fee_type=_okx_fee_type(fd), actual_fee=_fee, fee_ccy=_ccy,
                         filled_at=_db._utc_now_iso(),
                     )
-                    # Accumulate PnL for filled legs
                     leg_spec = exit_legs[i]
                     exit_px = float(fd.get("avgPx") or fd.get("px") or leg_spec["px"])
                     entry_order = leg_map.get(leg_spec["leg"])
@@ -1230,28 +1440,69 @@ async def _submit_exit_inner(
                         realized_pnl += (entry_px - exit_px) * qty
                 else:
                     _db.update_order_status(conn, oid_db, "failed")
+    finally:
+        conn.close()
 
+    # --- Auto-retry: one attempt for failed legs, 2 seconds later ---
+    if not all_filled:
+        failed_indices = [i for i in range(3) if filled_data[i] is None]
+        logger.info("[submit_exit] pos=%d 局部失败，2s 后自动重试 %d 腿: %s",
+                    position_id, len(failed_indices),
+                    [exit_legs[i]["leg"] for i in failed_indices])
+        await asyncio.sleep(2.0)
+
+        # Re-fetch passive prices for the failed legs
+        async with aiohttp.ClientSession(base_url=_OKX_REST_BASE) as sess_r:
+            retry_books = await asyncio.gather(
+                *[_fetch_order_book_top(sess_r, exit_legs[i]["inst_id"],
+                                       api_key=api_key, secret=secret,
+                                       passphrase=passphrase, is_paper=is_paper)
+                  for i in failed_indices],
+                return_exceptions=True,
+            )
+
+        retry_legs = []
+        for j, i in enumerate(failed_indices):
+            orig = exit_legs[i]
+            book = retry_books[j]
+            if isinstance(book, Exception) or book == (None, None):
+                px = orig["px"]
+            else:
+                bid, ask = book
+                px = bid if orig["side"] == "buy" else ask  # passive maker
+            retry_legs.append({**orig, "px": px})
+
+        retry_filled, retry_pnl = await _submit_and_poll_exit_legs_okx(
+            legs=retry_legs, qty=qty, position_id=position_id,
+            signal_id=position.get("signal_id"), leg_map=leg_map,
+            api_key=api_key, secret=secret, passphrase=passphrase, is_paper=is_paper,
+            sqlite_path=sqlite_path,
+        )
+        if retry_filled:
+            all_filled = True
+            realized_pnl += retry_pnl
+
+    # --- Update position status ---
+    conn = sqlite3.connect(sqlite_path)
+    try:
+        with conn:
             if all_filled:
                 _db.update_position_status(
-                    conn,
-                    position_id,
-                    "closed",
+                    conn, position_id, "closed",
                     realized_pnl_usdt=realized_pnl,
                     closed_at=_db._utc_now_iso(),
                 )
             else:
                 _db.update_position_status(
-                    conn,
-                    position_id,
-                    "partial_failed",
-                    last_error="出场失败：部分平仓单未在时限内成交",
+                    conn, position_id, "partial_failed",
+                    last_error="出场失败：重试后仍有平仓单未成交",
                 )
     finally:
         conn.close()
 
+    # --- Notifications ---
+    label = f"{symbol} {expiry} {int(strike)} {direction}"
     if all_filled:
-        # Send success Telegram
-        label = f"{symbol} {expiry} {int(strike)} {direction}"
         msg = (
             f"\U0001f4b0 止盈出场成功\n"
             f"{label}\n"
@@ -1262,21 +1513,7 @@ async def _submit_exit_inner(
         except Exception as exc:
             logger.warning("submit_exit: telegram notification failed: %s", exc)
     else:
-        reason = "one or more exit orders did not fill within timeout"
-        await _send_exit_failure_telegram(cfg, position, reason)
-        # Cancel unfilled exit orders at exchange
-        async with aiohttp.ClientSession(base_url=_OKX_REST_BASE) as session2:
-            for i, fr in enumerate(fill_results):
-                if (isinstance(fr, Exception) or fr is None) and exch_order_ids[i]:
-                    await _cancel_order(
-                        session2,
-                        inst_id=exit_legs[i]["inst_id"],
-                        ord_id=exch_order_ids[i],  # type: ignore[arg-type]
-                        api_key=api_key,
-                        secret=secret,
-                        passphrase=passphrase,
-                        is_paper=is_paper,
-                    )
+        await _send_exit_failure_telegram(cfg, position, "重试后仍有平仓单未成交")
 
 
 async def _submit_exit_deribit_inner(

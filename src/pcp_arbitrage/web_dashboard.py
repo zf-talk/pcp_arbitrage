@@ -584,6 +584,46 @@ async def run_web_dashboard_loop(
                 text=json.dumps({"ok": False, "error": result_msg}, ensure_ascii=False),
             )
 
+    async def _retry_exit_handler(request: web.Request) -> web.Response:
+        """手动重试平仓：对 partial_failed 仓位的失败腿重新下单。"""
+        if _app_cfg is None:
+            return web.Response(content_type="application/json", status=503,
+                                text=json.dumps({"ok": False, "error": "服务未就绪"}, ensure_ascii=False))
+        sqlite_path_retry = _app_cfg.sqlite_path
+        if not sqlite_path_retry:
+            return web.Response(content_type="application/json", status=400,
+                                text=json.dumps({"ok": False, "error": "未配置 sqlite_path"}, ensure_ascii=False))
+        try:
+            body = await request.json()
+            position_id = int(body["position_id"])
+        except Exception:
+            return web.Response(content_type="application/json", status=400,
+                                text=json.dumps({"ok": False, "error": "参数错误，需要 position_id"}, ensure_ascii=False))
+        import sqlite3 as _sqlite3
+        conn = _sqlite3.connect(sqlite_path_retry)
+        try:
+            conn.row_factory = _sqlite3.Row
+            row = conn.execute(
+                "SELECT id, exchange, symbol, expiry, strike, direction, status, signal_id, "
+                "call_inst_id, put_inst_id, future_inst_id FROM positions WHERE id=?",
+                (position_id,),
+            ).fetchone()
+        finally:
+            conn.close()
+        if row is None:
+            return web.Response(content_type="application/json", status=404,
+                                text=json.dumps({"ok": False, "error": f"持仓 {position_id} 不存在"}, ensure_ascii=False))
+        if row["status"] != "partial_failed":
+            return web.Response(content_type="application/json", status=400,
+                                text=json.dumps({"ok": False, "error": f"持仓状态为 {row['status']}，只能对 partial_failed 状态重试"}, ensure_ascii=False))
+        position = dict(row)
+        from pcp_arbitrage import order_manager as _om
+        ok, msg = await _om.retry_exit_position(position, _app_cfg, sqlite_path_retry)
+        return web.Response(
+            content_type="application/json",
+            text=json.dumps({"ok": ok, "message": msg}, ensure_ascii=False),
+        )
+
     async def _close_position_handler(request: web.Request) -> web.Response:
         """手动一键平仓：接收 position_id，调用 submit_exit 同时平掉三腿。"""
         if _app_cfg is None:
@@ -653,6 +693,7 @@ async def run_web_dashboard_loop(
     app.router.add_get("/api/opportunity-history", _opportunity_history_handler)
     app.router.add_post("/api/manual-entry", _manual_entry_handler)
     app.router.add_post("/api/close-position", _close_position_handler)
+    app.router.add_post("/api/retry-exit", _retry_exit_handler)
 
     runner = web.AppRunner(app, access_log_format='%a "%r" %s %b')
     await runner.setup()

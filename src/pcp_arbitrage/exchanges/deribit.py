@@ -440,6 +440,10 @@ class DeribitWebSocketClient:
         async with aiohttp.ClientSession() as session:
             async with session.ws_connect(self.WS_URL) as ws:
                 logger.info("[deribit ws] Connected")
+                if self._private_channels and not (self._api_key and self._secret):
+                    logger.warning(
+                        "[deribit ws] private_channels set but no credentials — private/subscribe will be skipped"
+                    )
                 if self._api_key and self._secret:
                     await self._ws_authenticate(ws)
                 await self._subscribe(ws)
@@ -505,16 +509,23 @@ class DeribitWebSocketClient:
             "id": _WS_AUTH_REQ_ID,
         }
         await ws.send_str(json.dumps(payload))
-        async for raw in ws:
-            if raw.type == aiohttp.WSMsgType.TEXT:
-                msg = json.loads(raw.data)
-                if msg.get("id") == _WS_AUTH_REQ_ID:
-                    if "error" in msg:
-                        raise RuntimeError(f"[deribit ws] WS auth failed: {msg['error']}")
-                    logger.info("[deribit ws] Authenticated via WebSocket")
-                    return
-            elif raw.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
-                raise ConnectionError("[deribit ws] Connection closed during WS auth")
+
+        async def _wait_for_auth() -> None:
+            async for raw in ws:
+                if raw.type == aiohttp.WSMsgType.TEXT:
+                    msg = json.loads(raw.data)
+                    if msg.get("id") == _WS_AUTH_REQ_ID:
+                        if "error" in msg:
+                            raise RuntimeError(f"[deribit ws] WS auth failed: {msg['error']}")
+                        logger.info("[deribit ws] Authenticated via WebSocket")
+                        return
+                elif raw.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
+                    raise ConnectionError("[deribit ws] Connection closed during WS auth")
+
+        try:
+            await asyncio.wait_for(_wait_for_auth(), timeout=10.0)
+        except asyncio.TimeoutError:
+            raise RuntimeError("[deribit ws] WS auth timed out after 10s")
 
     async def _subscribe_private(self, ws) -> None:
         """Subscribe to private channels (requires prior WS auth).

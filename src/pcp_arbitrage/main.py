@@ -1,5 +1,6 @@
 import argparse
 import asyncio
+import datetime
 import logging
 import logging.handlers
 import os
@@ -14,6 +15,7 @@ from pcp_arbitrage.signal_output import (
     configure_signal_output,
     dashboard_enabled,
     run_dashboard_loop,
+    run_heartbeat_loop,
     run_opportunity_csv_loop,
     run_opportunity_sqlite_loop,
     run_startup_revalidation_loop,
@@ -25,11 +27,33 @@ from pcp_arbitrage import web_dashboard as _wd
 _fmt = "%(asctime)s [%(levelname)s] %(message)s"
 logging.basicConfig(level=logging.INFO, format=_fmt)
 
+_LOG_MAX_BYTES = 50 * 1024 * 1024
 
-def _add_file_log_if_not_supervisor() -> None:
-    """本地直接运行时写入 data/logs；supervisor 下已由 redirect_stderr 合并到同一文件，避免重复。"""
-    if os.environ.get("SUPERVISOR_ENABLED") == "1":
-        return
+
+class _DatedSizeRotatingFileHandler(logging.handlers.RotatingFileHandler):
+    """当前始终写入固定文件名；达到 maxBytes 后重命名为带日期时间的归档文件，再新建当前文件。"""
+
+    def doRollover(self) -> None:
+        if self.stream:
+            self.stream.close()
+            self.stream = None
+        base = self.baseFilename
+        if os.path.exists(base):
+            stamp = datetime.datetime.now().strftime("%Y-%m-%d_%H%M%S")
+            dname, fname = os.path.split(base)
+            stem, ext = os.path.splitext(fname)
+            dfn = os.path.join(dname, f"{stem}.{stamp}{ext}")
+            n = 0
+            while os.path.exists(dfn):
+                n += 1
+                dfn = os.path.join(dname, f"{stem}.{stamp}.{n}{ext}")
+            os.rename(base, dfn)
+        if not self.delay:
+            self.stream = self._open()
+
+
+def _add_file_log_handler() -> None:
+    """写入 data/logs/pcp_arbitrage.log；单文件最大 50MB，满后归档为 pcp_arbitrage.YYYY-MM-DD_HHMMSS.log。"""
     root = Path(__file__).resolve().parent.parent.parent
     log_dir = root / "data" / "logs"
     try:
@@ -37,14 +61,14 @@ def _add_file_log_if_not_supervisor() -> None:
     except OSError:
         return
     path = log_dir / "pcp_arbitrage.log"
-    fh = logging.handlers.RotatingFileHandler(
-        path, maxBytes=20 * 1024 * 1024, backupCount=5, encoding="utf-8"
+    fh = _DatedSizeRotatingFileHandler(
+        path, maxBytes=_LOG_MAX_BYTES, backupCount=0, encoding="utf-8"
     )
     fh.setFormatter(logging.Formatter(_fmt))
     logging.getLogger().addHandler(fh)
 
 
-_add_file_log_if_not_supervisor()
+_add_file_log_handler()
 logger = logging.getLogger(__name__)
 
 def _apply_dashboard_log_quiet(cfg: AppConfig) -> None:
@@ -104,6 +128,7 @@ async def _run(cfg_path: str = "config.yaml", web_dashboard_override: str | None
     if cfg.sqlite_path:
         tasks.append(asyncio.create_task(run_opportunity_sqlite_loop()))
         tasks.append(asyncio.create_task(run_triplet_db_refresh_loop()))
+        tasks.append(asyncio.create_task(run_heartbeat_loop()))
     if dashboard_enabled():
         tasks.append(asyncio.create_task(run_dashboard_loop()))
         tasks.append(asyncio.create_task(run_startup_revalidation_loop()))
@@ -122,7 +147,9 @@ async def _run(cfg_path: str = "config.yaml", web_dashboard_override: str | None
         await asyncio.sleep(random.uniform(5, 15))  # 启动错开，避免与交易所握手撞车
         while True:
             try:
-                balances = await account_fetcher.fetch_all_balances(cfg)
+                balances = await account_fetcher.fetch_all_balances(
+                    cfg, skip_exchanges={"deribit", "deribit_linear"}
+                )
                 _wd.update_account_balances(balances)
             except Exception as exc:
                 logger.warning("[main] Balance fetch failed: %s", exc)

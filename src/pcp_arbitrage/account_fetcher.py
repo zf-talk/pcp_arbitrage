@@ -260,12 +260,16 @@ async def _get_deribit_balance(
         return None
 
 
-async def fetch_all_balances(cfg: "AppConfig") -> dict[str, dict]:
+async def fetch_all_balances(
+    cfg: "AppConfig", skip_exchanges: set[str] | None = None
+) -> dict[str, dict]:
     """Fetch balances for all enabled exchanges with API keys. Returns {exchange_name: balance_info}."""
     results: dict[str, dict] = {}
     tasks = []
     names = []
     for name, ex_cfg in cfg.exchanges.items():
+        if skip_exchanges and name in skip_exchanges:
+            continue
         if ex_cfg.enabled and ex_cfg.api_key:
             tasks.append(get_exchange_balance(ex_cfg, cfg))
             names.append(name)

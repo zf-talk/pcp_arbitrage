@@ -821,6 +821,30 @@ class DeribitLinearRunner:
                         update_dashboard_index_price(sym, float(idx_px))
                     return
 
+                # user.portfolio.USDC → real-time account balance update (USDC ≈ USD, no conversion needed)
+                if channel.startswith("user.portfolio."):
+                    def _sf(x: object) -> float:
+                        try:
+                            return float(x) if x is not None else 0.0
+                        except (TypeError, ValueError):
+                            return 0.0
+                    eq = _sf(data.get("equity"))
+                    avail = _sf(data.get("available_funds"))
+                    imr = _sf(data.get("initial_margin"))
+                    mmr = _sf(data.get("maintenance_margin"))
+                    denom = eq if eq > 0 else (avail if avail > 0 else 1.0)
+                    from pcp_arbitrage import web_dashboard as _wd
+                    _wd.update_single_account_balance("deribit_linear", {
+                        "total_eq_usdt": eq,
+                        "adj_eq_usdt": avail,
+                        "imr_usdt": imr,
+                        "mmr_usdt": mmr,
+                        "im_pct": (imr / denom * 100) if denom > 0 else 0.0,
+                        "mm_pct": (mmr / denom * 100) if denom > 0 else 0.0,
+                        "currency_details": {},
+                    })
+                    return
+
                 raw_name = data.get("instrument_name", "")
                 bids = data.get("bids", [])
                 asks = data.get("asks", [])
@@ -914,7 +938,14 @@ class DeribitLinearRunner:
             all_channels = channels + index_channels
             logger.info("[deribit-linear] Subscribing to %d channels + %d index channels",
                         len(channels), len(index_channels))
-            ws_client = DeribitWebSocketClient(on_message=on_message, on_reconnect=on_reconnect)
+            _portfolio_currency = "USDC"
+            ws_client = DeribitWebSocketClient(
+                on_message=on_message,
+                on_reconnect=on_reconnect,
+                api_key=ex.api_key or None,
+                secret=ex.secret_key or None,
+                private_channels=[f"user.portfolio.{_portfolio_currency}"] if ex.api_key else None,
+            )
             ws_client.set_channels(all_channels)
             if dashboard_enabled():
                 register_startup_market_sweep(_startup_sweep_deribit_linear)
@@ -1096,7 +1127,39 @@ class DeribitRunner:
                         # channel suffix: "btc_usd" → "BTC"
                         suffix = channel[len("deribit_price_index."):]
                         sym = suffix.split("_")[0].upper()
+                        spot_price_cache[sym] = float(idx_px)   # keep local cache current for portfolio conversion
                         update_dashboard_index_price(sym, float(idx_px))
+                    return
+
+                # user.portfolio.BTC → real-time account balance update
+                if channel.startswith("user.portfolio."):
+                    btc_usd = spot_price_cache.get("BTC", 0.0)
+                    if btc_usd <= 0:
+                        return  # wait for index price to arrive first
+                    def _sf(x: object) -> float:
+                        try:
+                            return float(x) if x is not None else 0.0
+                        except (TypeError, ValueError):
+                            return 0.0
+                    eq_coin = _sf(data.get("equity"))
+                    avail_coin = _sf(data.get("available_funds"))
+                    im_coin = _sf(data.get("initial_margin"))
+                    mm_coin = _sf(data.get("maintenance_margin"))
+                    total_eq = eq_coin * btc_usd
+                    adj_eq = avail_coin * btc_usd
+                    imr = im_coin * btc_usd
+                    mmr = mm_coin * btc_usd
+                    denom = total_eq if total_eq > 0 else (adj_eq if adj_eq > 0 else 1.0)
+                    from pcp_arbitrage import web_dashboard as _wd
+                    _wd.update_single_account_balance("deribit", {
+                        "total_eq_usdt": total_eq,
+                        "adj_eq_usdt": adj_eq,
+                        "imr_usdt": imr,
+                        "mmr_usdt": mmr,
+                        "im_pct": (imr / denom * 100) if denom > 0 else 0.0,
+                        "mm_pct": (mmr / denom * 100) if denom > 0 else 0.0,
+                        "currency_details": {},
+                    })
                     return
 
                 raw_name = data.get("instrument_name", "")
@@ -1202,7 +1265,14 @@ class DeribitRunner:
             all_channels = channels + index_channels
             logger.info("[deribit] Subscribing to %d channels + %d index channels",
                         len(channels), len(index_channels))
-            ws_client = DeribitWebSocketClient(on_message=on_message, on_reconnect=on_reconnect)
+            _portfolio_currency = "BTC"
+            ws_client = DeribitWebSocketClient(
+                on_message=on_message,
+                on_reconnect=on_reconnect,
+                api_key=ex.api_key or None,
+                secret=ex.secret_key or None,
+                private_channels=[f"user.portfolio.{_portfolio_currency}"] if ex.api_key else None,
+            )
             ws_client.set_channels(all_channels)
             if dashboard_enabled():
                 register_startup_market_sweep(_startup_sweep_deribit)

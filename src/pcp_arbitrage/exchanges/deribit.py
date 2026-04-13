@@ -12,6 +12,27 @@ from pcp_arbitrage.exchanges.okx import print_triplet_summary
 
 logger = logging.getLogger(__name__)
 
+# get_index_price：减轻公网限流（余额展示与 triplet 构建会重复请求）
+_INDEX_PRICE_CACHE_TTL_SEC = 10.0
+_INDEX_PRICE_STALE_MAX_SEC = 900.0  # 重试耗尽后仍可用此时间内的过期缓存
+_INDEX_PRICE_CACHE: dict[str, tuple[float, dict]] = {}
+
+_WS_AUTH_REQ_ID = 9000    # WS public/auth 请求 ID
+_WS_PRIV_SUB_ID = 9001    # WS private/subscribe 请求 ID
+
+
+def _deribit_retry_after_seconds(header_val: str | None, attempt: int) -> float:
+    """Parse Retry-After or use exponential backoff (capped)."""
+    if header_val:
+        try:
+            v = float(header_val)
+            if 0 < v <= 120:
+                return v
+        except ValueError:
+            pass
+    return min(2.0**attempt, 16.0)
+
+
 MONTH_MAP = {
     "JAN": "01", "FEB": "02", "MAR": "03", "APR": "04",
     "MAY": "05", "JUN": "06", "JUL": "07", "AUG": "08",
@@ -221,13 +242,49 @@ class DeribitRestClient:
         return data["result"]
 
     async def get_index_price(self, index_name: str) -> dict:
-        """Public endpoint. Returns result dict."""
+        """Public endpoint. Returns result dict. TTL cache + 429 retry + stale fallback."""
         assert self._session is not None
+        now = time.time()
+        cached = _INDEX_PRICE_CACHE.get(index_name)
+        if cached and now - cached[0] < _INDEX_PRICE_CACHE_TTL_SEC:
+            return cached[1]
+
         params = {"index_name": index_name}
-        async with self._session.get("/api/v2/public/get_index_price", params=params) as resp:
-            resp.raise_for_status()
-            data = await resp.json()
-        return data["result"]
+        url = "/api/v2/public/get_index_price"
+        max_attempts = 5
+        for attempt in range(max_attempts):
+            async with self._session.get(url, params=params) as resp:
+                if resp.status == 429:
+                    wait = _deribit_retry_after_seconds(
+                        resp.headers.get("Retry-After"), attempt
+                    )
+                    logger.warning(
+                        "[deribit] get_index_price 429 index=%r sleep=%.1fs (%d/%d)",
+                        index_name,
+                        wait,
+                        attempt + 1,
+                        max_attempts,
+                    )
+                    await asyncio.sleep(wait)
+                    continue
+                resp.raise_for_status()
+                data = await resp.json()
+            result = data["result"]
+            _INDEX_PRICE_CACHE[index_name] = (time.time(), result)
+            return result
+
+        now2 = time.time()
+        stale = _INDEX_PRICE_CACHE.get(index_name)
+        if stale and now2 - stale[0] < _INDEX_PRICE_STALE_MAX_SEC:
+            logger.warning(
+                "[deribit] get_index_price using stale cache for %r (age=%.0fs)",
+                index_name,
+                now2 - stale[0],
+            )
+            return stale[1]
+        raise RuntimeError(
+            f"Deribit get_index_price rate limited after {max_attempts} attempts: {index_name!r}"
+        )
 
     async def get_account_summary(self, currency: str) -> dict:
         """Private endpoint. Returns result dict."""
@@ -242,6 +299,97 @@ class DeribitRestClient:
             data = await resp.json()
         return data["result"]
 
+    async def get_order_book(self, instrument_name: str, depth: int = 1) -> dict:
+        """Public endpoint. Returns top-of-book with best_bid_price / best_ask_price."""
+        assert self._session is not None
+        params = {"instrument_name": instrument_name, "depth": depth}
+        async with self._session.get("/api/v2/public/get_order_book", params=params) as resp:
+            resp.raise_for_status()
+            data = await resp.json()
+        if "error" in data:
+            raise RuntimeError(f"Deribit get_order_book error: {data['error']}")
+        return data["result"]
+
+    async def place_order(self, side: str, instrument_name: str, amount: float, price: float) -> str:
+        """Place a limit order. side='buy'|'sell'. Returns order_id."""
+        await self._refresh_token_if_needed()
+        assert self._session is not None
+        method = "private/buy" if side == "buy" else "private/sell"
+        payload = {
+            "jsonrpc": "2.0",
+            "method": method,
+            "params": {
+                "instrument_name": instrument_name,
+                "amount": amount,
+                "type": "limit",
+                "price": price,
+                "time_in_force": "good_til_cancelled",
+            },
+            "id": 1,
+        }
+        headers = {"Authorization": f"Bearer {self._token}"}
+        async with self._session.post(f"/api/v2/{method}", json=payload, headers=headers) as resp:
+            resp.raise_for_status()
+            data = await resp.json()
+        if "error" in data:
+            raise RuntimeError(f"Deribit order error: {data['error']}")
+        return str(data["result"]["order"]["order_id"])
+
+    async def get_order_state(self, order_id: str) -> dict:
+        """Returns order state dict with fields: order_state, filled_amount, average_price."""
+        await self._refresh_token_if_needed()
+        assert self._session is not None
+        payload = {
+            "jsonrpc": "2.0",
+            "method": "private/get_order_state",
+            "params": {"order_id": order_id},
+            "id": 2,
+        }
+        headers = {"Authorization": f"Bearer {self._token}"}
+        async with self._session.post("/api/v2/private/get_order_state", json=payload, headers=headers) as resp:
+            resp.raise_for_status()
+            data = await resp.json()
+        if "error" in data:
+            raise RuntimeError(f"Deribit get_order_state error: {data['error']}")
+        return data["result"]
+
+    async def get_trades_by_order(self, order_id: str) -> list[dict]:
+        """Return trade records for an order. Each trade has a `liquidity` field: 'M' or 'T'."""
+        await self._refresh_token_if_needed()
+        assert self._session is not None
+        payload = {
+            "jsonrpc": "2.0",
+            "method": "private/get_user_trades_by_order",
+            "params": {"order_id": order_id},
+            "id": 4,
+        }
+        headers = {"Authorization": f"Bearer {self._token}"}
+        async with self._session.post(
+            "/api/v2/private/get_user_trades_by_order", json=payload, headers=headers
+        ) as resp:
+            resp.raise_for_status()
+            data = await resp.json()
+        if "error" in data:
+            raise RuntimeError(f"Deribit get_user_trades_by_order error: {data['error']}")
+        return data["result"].get("trades", data["result"]) if isinstance(data["result"], dict) else data["result"]
+
+    async def cancel_order(self, order_id: str) -> None:
+        """Cancel an order. Errors are logged but not raised."""
+        await self._refresh_token_if_needed()
+        assert self._session is not None
+        payload = {
+            "jsonrpc": "2.0",
+            "method": "private/cancel",
+            "params": {"order_id": order_id},
+            "id": 3,
+        }
+        headers = {"Authorization": f"Bearer {self._token}"}
+        try:
+            async with self._session.post("/api/v2/private/cancel", json=payload, headers=headers) as resp:
+                resp.raise_for_status()
+        except Exception as exc:
+            logger.warning("DeribitRestClient.cancel_order failed %s: %s", order_id, exc)
+
 
 class DeribitWebSocketClient:
     """Deribit JSON-RPC 2.0 WebSocket 客户端，单连接，指数退避重连。"""
@@ -254,10 +402,20 @@ class DeribitWebSocketClient:
     MAX_CHANNELS_PER_SUBSCRIBE = 500
     SUBSCRIBE_INTERVAL_SEC = 0.35   # public/subscribe 约 3.3/s，多批之间留间隔
 
-    def __init__(self, on_message, on_reconnect=None) -> None:
+    def __init__(
+        self,
+        on_message,
+        on_reconnect=None,
+        api_key: str | None = None,
+        secret: str | None = None,
+        private_channels: list[str] | None = None,
+    ) -> None:
         self._on_message = on_message
         self._on_reconnect = on_reconnect
         self._channels: list[str] = []
+        self._api_key = api_key
+        self._secret = secret
+        self._private_channels: list[str] = private_channels or []
 
     def set_channels(self, channels: list[str]) -> None:
         self._channels = channels
@@ -282,7 +440,11 @@ class DeribitWebSocketClient:
         async with aiohttp.ClientSession() as session:
             async with session.ws_connect(self.WS_URL) as ws:
                 logger.info("[deribit ws] Connected")
+                if self._api_key and self._secret:
+                    await self._ws_authenticate(ws)
                 await self._subscribe(ws)
+                if self._private_channels:
+                    await self._subscribe_private(ws)
                 ping_task = asyncio.create_task(self._heartbeat(ws))
                 try:
                     async for msg in ws:
@@ -324,6 +486,50 @@ class DeribitWebSocketClient:
         while True:
             await asyncio.sleep(self.HEARTBEAT_INTERVAL)
             await ws.send_str(ping)
+
+    async def _ws_authenticate(self, ws) -> None:
+        """Send public/auth over WS and wait for the response before continuing.
+
+        Note: on_message filters to method=='subscription', so auth response
+        (id=9000, no method field) is NOT routed through on_message — it is
+        consumed here in the manual recv loop, avoiding any conflict.
+        """
+        payload = {
+            "jsonrpc": "2.0",
+            "method": "public/auth",
+            "params": {
+                "grant_type": "client_credentials",
+                "client_id": self._api_key,
+                "client_secret": self._secret,
+            },
+            "id": _WS_AUTH_REQ_ID,
+        }
+        await ws.send_str(json.dumps(payload))
+        async for raw in ws:
+            if raw.type == aiohttp.WSMsgType.TEXT:
+                msg = json.loads(raw.data)
+                if msg.get("id") == _WS_AUTH_REQ_ID:
+                    if "error" in msg:
+                        raise RuntimeError(f"[deribit ws] WS auth failed: {msg['error']}")
+                    logger.info("[deribit ws] Authenticated via WebSocket")
+                    return
+            elif raw.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
+                raise ConnectionError("[deribit ws] Connection closed during WS auth")
+
+    async def _subscribe_private(self, ws) -> None:
+        """Subscribe to private channels (requires prior WS auth).
+
+        The subscribe response (id=9001) has no 'method' field and is silently
+        ignored by on_message callbacks (which filter to method=='subscription').
+        """
+        payload = {
+            "jsonrpc": "2.0",
+            "method": "private/subscribe",
+            "params": {"channels": self._private_channels},
+            "id": _WS_PRIV_SUB_ID,
+        }
+        await ws.send_str(json.dumps(payload))
+        logger.info("[deribit ws] Sent private/subscribe for %d channels", len(self._private_channels))
 
 
 async def _run_ws_with_tick(
@@ -532,6 +738,7 @@ class DeribitLinearRunner:
                 now_ms=now_ms,
                 margin_type="usdc",
                 min_days_to_expiry=app.min_days_to_expiry,
+                exchange="deribit_linear",
             )
             logger.info("[deribit-linear] Built %d triplets", len(triplets))
             register_dashboard_runner_meta(
@@ -806,6 +1013,7 @@ class DeribitRunner:
                 now_ms=now_ms,
                 margin_type=margin_type,
                 min_days_to_expiry=app.min_days_to_expiry,
+                exchange="deribit",
             )
             logger.info("[deribit] Built %d triplets", len(triplets))
             register_dashboard_runner_meta(

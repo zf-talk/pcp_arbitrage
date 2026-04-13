@@ -1200,45 +1200,38 @@ async def _submit_exit_inner(
         else:
             filled_data.append(fr)
 
-    if all_filled:
-        # Calculate realized PnL
-        # For each leg: (exit_filled_px - entry_limit_px) * qty with direction sign
-        # forward: entry was buy call (+), sell put (-), sell future (-)
-        #          exit is sell call (-), buy put (+), buy future (+)
-        # net PnL = (entry_call_px - exit_call_px) + (exit_put_px - entry_put_px)
-        #           + (exit_future_px - entry_future_px)  [all in coin terms]
-        # We use filled prices where available
-        realized_pnl = 0.0
-        for i, leg_spec in enumerate(exit_legs):
-            fd = filled_data[i]
-            exit_px = float(fd.get("avgPx") or fd.get("px") or leg_spec["px"]) if fd else leg_spec["px"]  # type: ignore[union-attr]
-            entry_order = leg_map.get(leg_spec["leg"])
-            entry_px = float(entry_order.get("filled_px") or entry_order.get("limit_px") or 0.0) if entry_order else 0.0
-            # Sign: exit sell = -qty, exit buy = +qty (from perspective of PnL)
-            # forward exit: sell call (we previously bought), sell price > buy price = gain
-            #   PnL component = (exit_px - entry_px) * qty  with appropriate sign
-            if leg_spec["side"] == "sell":
-                realized_pnl += (exit_px - entry_px) * qty
-            else:
-                realized_pnl += (entry_px - exit_px) * qty
-
-        # Update DB orders as filled
-        conn = sqlite3.connect(sqlite_path)
-        try:
-            with conn:
-                for i, oid_db in enumerate(exit_order_ids_db):
-                    fd = filled_data[i]
-                    _fee, _ccy = _okx_fee(fd) if fd else (None, None)
+    # --- Always update each order's status individually (filled or failed) ---
+    realized_pnl = 0.0
+    conn = sqlite3.connect(sqlite_path)
+    try:
+        with conn:
+            for i, oid_db in enumerate(exit_order_ids_db):
+                fd = filled_data[i]
+                if fd is not None:
+                    _fee, _ccy = _okx_fee(fd)
                     _db.update_order_status(
                         conn,
                         oid_db,
                         "filled",
-                        filled_px=float(fd.get("avgPx") or fd.get("px") or 0) if fd else 0.0,  # type: ignore[union-attr]
-                        fee_type=_okx_fee_type(fd) if fd else None,
+                        filled_px=float(fd.get("avgPx") or fd.get("px") or 0),
+                        fee_type=_okx_fee_type(fd),
                         actual_fee=_fee,
                         fee_ccy=_ccy,
                         filled_at=_db._utc_now_iso(),
                     )
+                    # Accumulate PnL for filled legs
+                    leg_spec = exit_legs[i]
+                    exit_px = float(fd.get("avgPx") or fd.get("px") or leg_spec["px"])
+                    entry_order = leg_map.get(leg_spec["leg"])
+                    entry_px = float(entry_order.get("filled_px") or entry_order.get("limit_px") or 0.0) if entry_order else 0.0
+                    if leg_spec["side"] == "sell":
+                        realized_pnl += (exit_px - entry_px) * qty
+                    else:
+                        realized_pnl += (entry_px - exit_px) * qty
+                else:
+                    _db.update_order_status(conn, oid_db, "failed")
+
+            if all_filled:
                 _db.update_position_status(
                     conn,
                     position_id,
@@ -1246,9 +1239,17 @@ async def _submit_exit_inner(
                     realized_pnl_usdt=realized_pnl,
                     closed_at=_db._utc_now_iso(),
                 )
-        finally:
-            conn.close()
+            else:
+                _db.update_position_status(
+                    conn,
+                    position_id,
+                    "partial_failed",
+                    last_error="出场失败：部分平仓单未在时限内成交",
+                )
+    finally:
+        conn.close()
 
+    if all_filled:
         # Send success Telegram
         label = f"{symbol} {expiry} {int(strike)} {direction}"
         msg = (
@@ -1262,10 +1263,6 @@ async def _submit_exit_inner(
             logger.warning("submit_exit: telegram notification failed: %s", exc)
     else:
         reason = "one or more exit orders did not fill within timeout"
-        _update_exit_failed(
-            sqlite_path, position_id, exit_order_ids_db,
-            reason="平仓单未在时限内全部成交",
-        )
         await _send_exit_failure_telegram(cfg, position, reason)
         # Cancel unfilled exit orders at exchange
         async with aiohttp.ClientSession(base_url=_OKX_REST_BASE) as session2:

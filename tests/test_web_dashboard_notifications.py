@@ -90,3 +90,15 @@ async def test_notification_push_loop_adds_type() -> None:
     assert parsed["direction"] == "正向"
     assert parsed["ann_pct"] == 20.0
     assert parsed["net_profit"] == 50.0
+
+
+def test_update_single_account_balance_merges() -> None:
+    """update_single_account_balance should merge one exchange without wiping others."""
+    from pcp_arbitrage import web_dashboard
+    web_dashboard._account_balances_cache.clear()
+    web_dashboard.update_account_balances({"okx": {"total_eq_usdt": 1000.0}})
+
+    web_dashboard.update_single_account_balance("deribit", {"total_eq_usdt": 500.0})
+
+    assert web_dashboard._account_balances_cache["okx"]["total_eq_usdt"] == 1000.0
+    assert web_dashboard._account_balances_cache["deribit"]["total_eq_usdt"] == 500.0

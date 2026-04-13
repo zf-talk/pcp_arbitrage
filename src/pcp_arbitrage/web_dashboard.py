@@ -10,6 +10,9 @@ from typing import TYPE_CHECKING
 
 from jinja2 import Environment, FileSystemLoader, select_autoescape
 
+from pcp_arbitrage.config import DEFAULT_LOT_SIZES
+from pcp_arbitrage.exchange_symbols import format_strike_display
+
 if TYPE_CHECKING:
     from pcp_arbitrage.opportunity_dashboard import OpportunityDashboard
 
@@ -19,6 +22,9 @@ _TEMPLATE_DIR = Path(__file__).resolve().parent / "templates"
 _jinja_env: Environment | None = None
 
 _notification_queue: asyncio.Queue[dict] = asyncio.Queue()
+
+# Queue for real-time leg price patches pushed to WS clients
+_leg_prices_queue: asyncio.Queue[dict] = asyncio.Queue()
 
 # Cache for open positions, updated by position_tracker after each poll
 _open_positions_cache: list[dict] = []
@@ -31,11 +37,150 @@ _account_balances_cache: dict[
 # Reference to AppConfig, set when the dashboard starts
 _app_cfg = None  # type: ignore[assignment]
 
+# Track order IDs currently being fee-backfilled to avoid duplicate requests
+_fee_backfill_in_progress: set[int] = set()
+
 
 def set_app_config(cfg) -> None:  # type: ignore[type-arg]
     """Store AppConfig reference for use in payload building."""
     global _app_cfg
     _app_cfg = cfg
+
+
+def _position_contract_coin_mult(pos: dict) -> float:
+    """每张合约对应的标的币数量（与 YAML contracts.lot_size / DEFAULT_LOT_SIZES 一致），用于「币」列与浮动盈亏。"""
+    raw = pos.get("symbol")
+    sym = str(raw or "").strip().upper()
+    if _app_cfg and sym:
+        lot = _app_cfg.lot_size
+        for key in (raw, sym):
+            if key is None or key == "":
+                continue
+            if key not in lot:
+                continue
+            try:
+                v = float(lot[key])
+            except (TypeError, ValueError):
+                continue
+            if v > 0:
+                return v
+    return float(DEFAULT_LOT_SIZES.get(sym, 1.0))
+
+
+def _min_open_filled_contract_qty(open_orders: list[dict]) -> float | None:
+    """三腿开仓单均已成交时，取各腿数量最小值（与深度约束一致）。"""
+    qties: list[float] = []
+    for leg in ("call", "put", "future"):
+        legs = [o for o in open_orders if o.get("leg") == leg and o.get("status") == "filled"]
+        if not legs:
+            return None
+        q = legs[0].get("filled_qty")
+        if q is None:
+            q = legs[0].get("qty")
+        if q is None:
+            return None
+        try:
+            qties.append(float(q))
+        except (TypeError, ValueError):
+            return None
+    return min(qties)
+
+
+def _fetch_opportunity_gross_fee_tradeable(
+    path: str,
+    signal_id: int | None,
+    exchange: str,
+    contract: str,
+    direction: str,
+) -> tuple[float | None, float | None, float | None]:
+    """已结束的 session 或当前机会表中的价差 gross / 手续费 / 可交易深度（用于按仓位数量缩放）。"""
+    import sqlite3
+
+    con = sqlite3.connect(path)
+    try:
+        con.row_factory = sqlite3.Row
+        if signal_id is not None:
+            row = con.execute(
+                "SELECT gross_usdt, fee_usdt, tradeable FROM opportunity_sessions WHERE id=?",
+                (int(signal_id),),
+            ).fetchone()
+            if row is not None and row["gross_usdt"] is not None:
+                try:
+                    g = float(row["gross_usdt"])
+                    f = float(row["fee_usdt"] or 0)
+                    t_raw = row["tradeable"]
+                    t_f = float(t_raw) if t_raw is not None else None
+                    return g, f, t_f
+                except (TypeError, ValueError):
+                    pass
+        row = con.execute(
+            "SELECT gross_usdt, fee_usdt, tradeable FROM opportunity_current "
+            "WHERE lower(exchange)=lower(?) AND contract=? AND direction=?",
+            (exchange, contract, direction),
+        ).fetchone()
+        if row is not None and row["gross_usdt"] is not None:
+            try:
+                g = float(row["gross_usdt"])
+                f = float(row["fee_usdt"] or 0)
+                t_raw = row["tradeable"]
+                t_f = float(t_raw) if t_raw is not None else None
+                return g, f, t_f
+            except (TypeError, ValueError):
+                pass
+    finally:
+        con.close()
+    return None, None, None
+
+
+def _fee_order_to_usdt(order: dict, index_usdt: float | None, symbol_upper: str) -> float | None:
+    if order.get("status") != "filled":
+        return 0.0
+    afu = order.get("actual_fee_usdt")
+    if afu is not None:
+        try:
+            v = float(afu)
+            return v if v >= 0 else None
+        except (TypeError, ValueError):
+            pass
+    af = order.get("actual_fee")
+    if af is None:
+        return None
+    try:
+        af = float(af)
+    except (TypeError, ValueError):
+        return None
+    ccy = str(order.get("fee_ccy") or "").upper()
+    if ccy == "USDT":
+        return af
+    if index_usdt and ccy and ccy == symbol_upper and float(index_usdt) > 0:
+        return af * float(index_usdt)
+    return None
+
+
+def _sum_position_orders_fee_usdt(
+    orders: list[dict], index_usdt: float | None, symbol: str
+) -> float | None:
+    symu = str(symbol or "").strip().upper()
+    filled = [o for o in orders if o.get("status") == "filled"]
+    if not filled:
+        return None
+    total = 0.0
+    for o in filled:
+        part = _fee_order_to_usdt(o, index_usdt, symu)
+        if part is None:
+            return None
+        total += part
+    return total
+
+
+def _scaled_total_spread_usdt(
+    gross: float | None, tradeable: float | None, qty: float | None
+) -> float | None:
+    if gross is None:
+        return None
+    if qty is not None and tradeable is not None and tradeable > 0:
+        return gross * (qty / tradeable)
+    return gross
 
 
 def update_positions_cache(positions: list[dict]) -> None:
@@ -50,9 +195,19 @@ def update_account_balances(balances: dict[str, dict]) -> None:
     _account_balances_cache = dict(balances)
 
 
+def update_single_account_balance(name: str, bal: dict) -> None:
+    """Merge one exchange's balance into cache without replacing other exchanges."""
+    _account_balances_cache[name] = bal
+
+
 def push_notification(notification: dict) -> None:
     """Enqueue a notification for broadcast to all web dashboard clients."""
     _notification_queue.put_nowait(notification)
+
+
+def push_leg_prices_patch(patch: dict) -> None:
+    """Enqueue a leg_prices patch for immediate WS broadcast. patch = {pos_id: {leg: {...}}}."""
+    _leg_prices_queue.put_nowait(patch)
 
 
 def _get_jinja_env() -> Environment:
@@ -157,10 +312,16 @@ async def run_web_dashboard_loop(
             aggregate_opportunity_sessions_stats,
             daily_expected_max_series_local,
             list_opportunity_sessions_history,
+            get_session_ids_with_positions,
         )
 
         sessions = list_opportunity_sessions_history(sqlite_path, limit=lim)
         payload: dict = {"sessions": sessions}
+        try:
+            payload["session_position_map"] = get_session_ids_with_positions(sqlite_path)
+        except Exception as exc:
+            logger.warning("[web_dashboard] session_position_map: %s", exc)
+            payload["session_position_map"] = {}
         try:
             payload["session_stats"] = aggregate_opportunity_sessions_stats(sqlite_path)
         except Exception as exc:
@@ -289,7 +450,7 @@ async def run_web_dashboard_loop(
             except (ValueError, AttributeError):
                 strike = float(row.strike) if row.strike is not None else 0.0
             cur = conn.execute(
-                "SELECT symbol, expiry, strike, call_id, put_id, future_id FROM triplets "
+                "SELECT exchange, symbol, expiry, strike, call_id, put_id, future_id FROM triplets "
                 "WHERE exchange=? AND symbol=? AND expiry=? AND ABS(strike-?)<=0.01 LIMIT 1",
                 (exchange, sym, expiry, strike),
             )
@@ -312,6 +473,7 @@ async def run_web_dashboard_loop(
         from pcp_arbitrage.pcp_calculator import ArbitrageSignal
 
         triplet = Triplet(
+            exchange=triplet_row["exchange"],
             symbol=triplet_row["symbol"],
             expiry=triplet_row["expiry"],
             strike=float(triplet_row["strike"]),
@@ -353,7 +515,7 @@ async def run_web_dashboard_loop(
         from pcp_arbitrage import order_manager as _om
         from pcp_arbitrage import web_dashboard as _self_wd
 
-        ok, result_msg = await _om.submit_entry(triplet, signal, None, _app_cfg, sqlite_path_entry)
+        ok, result_msg = await _om.submit_entry(triplet, signal, row.active_session_id, _app_cfg, sqlite_path_entry)
         direction_str = "正向" if direction_key == "forward" else "反向"
         if ok:
             _self_wd.push_notification(
@@ -470,15 +632,173 @@ async def run_web_dashboard_loop(
             notif = await _notification_queue.get()
             await _broadcast(json.dumps({"type": "notification", **notif}, ensure_ascii=False))
 
+    async def _leg_prices_push_loop() -> None:
+        """Merge and push leg_prices patches to WS clients immediately."""
+        while True:
+            try:
+                patch = await _leg_prices_queue.get()
+                if not data_clients:
+                    while not _leg_prices_queue.empty():
+                        try:
+                            _leg_prices_queue.get_nowait()
+                        except Exception:
+                            break
+                    continue
+                # Merge any additional patches that arrived concurrently
+                merged: dict = {}
+                for pos_id_s, legs in patch.items():
+                    merged.setdefault(str(pos_id_s), {}).update(legs)
+                while not _leg_prices_queue.empty():
+                    try:
+                        extra = _leg_prices_queue.get_nowait()
+                        for pos_id_s, legs in extra.items():
+                            merged.setdefault(str(pos_id_s), {}).update(legs)
+                    except Exception:
+                        break
+                await _broadcast(json.dumps({"leg_prices": merged}, ensure_ascii=False))
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.warning("[web_dashboard] leg_prices push error: %s", exc)
+
     asyncio.ensure_future(_price_push_loop())
     asyncio.ensure_future(_broadcast_loop())
     asyncio.ensure_future(_notification_push_loop())
+    asyncio.ensure_future(_leg_prices_push_loop())
 
     try:
         while True:
             await asyncio.sleep(3600)
     finally:
         await runner.cleanup()
+
+
+async def _backfill_order_fee(order: dict, sqlite_path: str) -> None:
+    """Fetch actual fee from exchange for a filled order and write it to DB.
+
+    Supports OKX (uses inst_id + exchange_order_id) and Deribit (uses exchange_order_id).
+    On completion, removes the order_id from _fee_backfill_in_progress.
+    """
+    import sqlite3 as _sqlite3
+    import aiohttp
+
+    order_id: int = order["id"]
+    exchange_order_id: str = order["exchange_order_id"]
+    inst_id: str | None = order.get("inst_id")
+    exchange: str = (order.get("exchange") or "").lower()
+
+    try:
+        from pcp_arbitrage import db as _db
+
+        if exchange == "deribit":
+            try:
+                from pcp_arbitrage.exchanges.deribit import DeribitRestClient
+                exc_cfg = _app_cfg.exchanges.get("DERIBIT") or _app_cfg.exchanges.get("deribit") if _app_cfg else None
+                if exc_cfg is None:
+                    return
+                async with DeribitRestClient(api_key=exc_cfg.api_key, secret=exc_cfg.secret_key) as dclient:
+                    await dclient._authenticate()
+                    order_state = await dclient.get_order_state(exchange_order_id)
+                commission = order_state.get("commission")
+                fee_val = abs(float(commission)) if commission is not None else None
+                # Infer currency from instrument name
+                iname = order_state.get("instrument_name", "")
+                fee_ccy = iname.split("-")[0] if iname else None
+                avg_px_raw = order_state.get("average_price")
+                avg_px = float(avg_px_raw) if avg_px_raw else None
+                filled_amt = order_state.get("filled_amount")
+                _filled_qty = float(filled_amt) if filled_amt else None
+                # Get fee type from trades
+                from pcp_arbitrage.order_manager import _deribit_fee_type
+                trades = await dclient.get_trades_by_order(exchange_order_id)
+                _fee_type = _deribit_fee_type(trades)
+                # Only write filled_px/filled_qty if currently missing
+                fp_to_write = avg_px if order.get("filled_px") is None else None
+                fq_to_write = _filled_qty if order.get("filled_qty") is None else None
+                conn = _sqlite3.connect(sqlite_path)
+                try:
+                    with conn:
+                        _db.update_order_status(
+                            conn, order_id, order.get("status", "filled"),
+                            filled_px=fp_to_write,
+                            filled_qty=fq_to_write,
+                            fee_type=_fee_type,
+                            actual_fee=fee_val, fee_ccy=fee_ccy,
+                        )
+                finally:
+                    conn.close()
+                logger.debug("[fee_backfill] deribit order %d avg_px=%s filled_qty=%s fee=%s %s fee_type=%s",
+                             order_id, avg_px, _filled_qty, fee_val, fee_ccy, _fee_type)
+            except Exception as exc:
+                logger.warning("[fee_backfill] deribit order %d: %s", order_id, exc)
+        else:
+            # OKX
+            if not inst_id or not _app_cfg:
+                return
+            exc_cfg = _app_cfg.exchanges.get("OKX") or _app_cfg.exchanges.get("okx")
+            if exc_cfg is None:
+                return
+            from pcp_arbitrage.okx_client import _sign, _timestamp
+            from pcp_arbitrage.order_manager import _auth_headers
+
+            params_str = f"instId={inst_id}&ordId={exchange_order_id}"
+            path = f"/api/v5/trade/order?{params_str}"
+            ts = _timestamp()
+            from pcp_arbitrage.okx_client import _sign as _s
+            sig = _s(exc_cfg.secret_key, ts, "GET", path, "")
+            headers = {
+                "OK-ACCESS-KEY": exc_cfg.api_key,
+                "OK-ACCESS-SIGN": sig,
+                "OK-ACCESS-TIMESTAMP": ts,
+                "OK-ACCESS-PASSPHRASE": exc_cfg.passphrase,
+                "Content-Type": "application/json",
+            }
+            if exc_cfg.is_paper_trading:
+                headers["x-simulated-trading"] = "1"
+            try:
+                async with aiohttp.ClientSession() as session:
+                    async with session.get(
+                        "https://www.okx.com" + path,
+                        headers=headers,
+                        timeout=aiohttp.ClientTimeout(total=10),
+                    ) as resp:
+                        data = await resp.json()
+                orders_data = data.get("data", [])
+                if not orders_data:
+                    return
+                od = orders_data[0]
+                fee    = float(od.get("fee")    or 0)
+                rebate = float(od.get("rebate") or 0)
+                net_fee = abs(fee + rebate)
+                fee_ccy = od.get("feeCcy") or od.get("rebateCcy") or None
+                avg_px_raw = od.get("avgPx")
+                avg_px = float(avg_px_raw) if avg_px_raw else None
+                filled_sz = od.get("fillSz")
+                _filled_qty = float(filled_sz) if filled_sz else None
+                # Get fee type (maker/taker)
+                from pcp_arbitrage.order_manager import _okx_fee_type
+                _fee_type = _okx_fee_type(od)
+                # Only write filled_px/filled_qty if currently missing
+                fp_to_write = avg_px if order.get("filled_px") is None else None
+                fq_to_write = _filled_qty if order.get("filled_qty") is None else None
+                conn = _sqlite3.connect(sqlite_path)
+                try:
+                    with conn:
+                        _db.update_order_status(
+                            conn, order_id, order.get("status", "filled"),
+                            filled_px=fp_to_write,
+                            filled_qty=fq_to_write,
+                            fee_type=_fee_type,
+                            actual_fee=net_fee, fee_ccy=fee_ccy,
+                        )
+                finally:
+                    conn.close()
+                logger.debug("[fee_backfill] okx order %d avg_px=%s filled_qty=%s fee=%.6f %s fee_type=%s",
+                             order_id, avg_px, _filled_qty, net_fee, fee_ccy, _fee_type)
+            except Exception as exc:
+                logger.warning("[fee_backfill] okx order %d: %s", order_id, exc)
+    finally:
+        _fee_backfill_in_progress.discard(order_id)
 
 
 def _dedupe_opp_rows_for_web(rows: list[dict]) -> list[dict]:
@@ -623,8 +943,29 @@ def _build_payload(dash: "OpportunityDashboard", *, full: bool) -> dict:
                 }
             )
         payload["rows"] = _dedupe_opp_rows_for_web(rows)
-    payload["positions"] = [
-        {
+    sqlite_path_pos = getattr(dash, "_sqlite_path", None)
+
+    # Merge open positions (from tracker cache) + recent failed positions (from DB)
+    open_ids = {pos["id"] for pos in _open_positions_cache}
+    all_pos_rows = list(_open_positions_cache)
+    if sqlite_path_pos:
+        try:
+            import sqlite3 as _sqlite3
+            from pcp_arbitrage.db import get_failed_positions
+            with _sqlite3.connect(sqlite_path_pos) as _conn:
+                for fp in get_failed_positions(_conn):
+                    if fp["id"] not in open_ids:
+                        all_pos_rows.append(fp)
+        except Exception:
+            pass
+
+    positions_out = []
+    for pos in all_pos_rows:
+        # Build per-leg entry info from orders
+        leg_entry: dict[str, dict] = {}
+        open_orders: list[dict] = []
+        # Build position output
+        entry: dict = {
             "id": pos["id"],
             "exchange": pos["exchange"],
             "symbol": pos["symbol"],
@@ -632,11 +973,91 @@ def _build_payload(dash: "OpportunityDashboard", *, full: bool) -> dict:
             "strike": pos["strike"],
             "direction": pos["direction"],
             "status": pos["status"],
+            "last_error": pos.get("last_error"),
             "current_mark_usdt": pos.get("current_mark_usdt"),
             "opened_at": pos["opened_at"],
+            "call_inst_id": pos.get("call_inst_id"),
+            "put_inst_id": pos.get("put_inst_id"),
+            "future_inst_id": pos.get("future_inst_id"),
+            "index_price_usdt": dash._index_prices.get(pos["symbol"]) if dash else None,
+            "ct_val": _position_contract_coin_mult(pos),
+            "orders": [],
+            "total_spread_usdt": None,
+            "total_fee_usdt": None,
+            "total_float_profit_usdt": None,
         }
-        for pos in _open_positions_cache
-    ]
+        if sqlite_path_pos:
+            try:
+                import sqlite3 as _sqlite3
+                from pcp_arbitrage.db import get_position_orders
+                with _sqlite3.connect(sqlite_path_pos) as _conn:
+                    open_orders = get_position_orders(_conn, pos["id"], action="open")
+                    close_orders = get_position_orders(_conn, pos["id"], action="close")
+                    entry["orders"] = open_orders + close_orders
+                    # Build leg_entry from filled open orders
+                    for o in open_orders:
+                        if o.get("status") == "filled" and o.get("filled_px") is not None:
+                            leg_entry[o["leg"]] = {
+                                "filled_px": o["filled_px"],
+                                "qty": o["qty"],
+                                "filled_qty": o.get("filled_qty"),
+                                "side": o["side"],
+                                "fee_ccy": o.get("fee_ccy"),
+                                "inst_id": o.get("inst_id"),
+                            }
+                    # Trigger backfill for filled orders with missing actual_fee or filled_px
+                    sqlite_path_fee = sqlite_path_pos
+                    for o in open_orders + close_orders:
+                        if (
+                            o.get("status") == "filled"
+                            and (o.get("actual_fee") is None or o.get("filled_px") is None or o.get("filled_qty") is None or o.get("fee_type") is None)
+                            and o.get("exchange_order_id")
+                            and o["id"] not in _fee_backfill_in_progress
+                        ):
+                            o_with_exchange = dict(o)
+                            o_with_exchange["exchange"] = pos["exchange"]
+                            _fee_backfill_in_progress.add(o["id"])
+                            try:
+                                asyncio.ensure_future(
+                                    _backfill_order_fee(o_with_exchange, sqlite_path_fee)
+                                )
+                            except RuntimeError:
+                                # No running event loop (e.g., called from sync context)
+                                _fee_backfill_in_progress.discard(o["id"])
+            except Exception:
+                pass
+        entry["leg_entry"] = leg_entry
+        contract_label = (
+            f"{pos['symbol']}-{pos['expiry']}-"
+            f"{format_strike_display(pos['symbol'], float(pos['strike']))}"
+        )
+        gross_snap, _fee_snap, tradeable_snap = None, None, None
+        if sqlite_path_pos:
+            gross_snap, _fee_snap, tradeable_snap = _fetch_opportunity_gross_fee_tradeable(
+                sqlite_path_pos,
+                pos.get("signal_id"),
+                str(pos.get("exchange") or ""),
+                contract_label,
+                str(pos.get("direction") or ""),
+            )
+        qty_min = _min_open_filled_contract_qty(open_orders)
+        entry["total_spread_usdt"] = _scaled_total_spread_usdt(
+            gross_snap, tradeable_snap, qty_min
+        )
+        entry["total_fee_usdt"] = _sum_position_orders_fee_usdt(
+            entry["orders"], entry.get("index_price_usdt"), str(pos.get("symbol") or "")
+        )
+        _ts, _tf = entry["total_spread_usdt"], entry["total_fee_usdt"]
+        if _ts is not None and _tf is not None:
+            try:
+                entry["total_float_profit_usdt"] = float(_ts) - float(_tf)
+            except (TypeError, ValueError):
+                entry["total_float_profit_usdt"] = None
+        # Attach live prices from tracker cache
+        from pcp_arbitrage import position_tracker as _pt
+        entry["leg_live"] = _pt.get_leg_prices_cache().get(pos["id"], {})
+        positions_out.append(entry)
+    payload["positions"] = positions_out
     # Add account balances and arbitrage_enabled status
     if _app_cfg:
         account_info = []

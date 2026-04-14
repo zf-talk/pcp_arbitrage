@@ -432,6 +432,92 @@ async def test_exit_triggered_when_near_expiry(tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# Test: exit_monitor_loop daemon
+# ---------------------------------------------------------------------------
+
+import asyncio as _asyncio
+import unittest.mock as _mock
+from pcp_arbitrage import order_manager as _om
+
+
+@pytest.mark.asyncio
+async def test_exit_monitor_picks_up_partial_failed(tmp_path, monkeypatch):
+    """守护协程应接管 partial_failed 仓位并调用 submit_exit"""
+    db_path = str(tmp_path / "test.db")
+    con = sqlite3.connect(db_path)
+    con.execute("""
+        CREATE TABLE positions (
+            id INTEGER PRIMARY KEY, status TEXT, exchange TEXT,
+            exit_attempt_count INTEGER DEFAULT 0,
+            exit_started_at TEXT, exit_last_attempt_at TEXT
+        )
+    """)
+    con.execute("INSERT INTO positions (id, status, exchange) VALUES (1, 'partial_failed', 'okx')")
+    con.commit()
+    con.close()
+
+    submitted = []
+    async def fake_submit_exit(pos, cfg, path):
+        submitted.append(pos["id"])
+
+    cfg = _mock.MagicMock()
+    cfg.sqlite_path = db_path
+    cfg.exit_monitor_interval_secs = 0.05  # 50ms
+
+    monkeypatch.setattr(_om, "submit_exit", fake_submit_exit)
+
+    task = _asyncio.create_task(position_tracker.exit_monitor_loop(cfg))
+    await _asyncio.sleep(0.2)
+    task.cancel()
+    try:
+        await task
+    except _asyncio.CancelledError:
+        pass
+
+    assert 1 in submitted
+
+
+@pytest.mark.asyncio
+async def test_exit_monitor_no_duplicate(tmp_path, monkeypatch):
+    """同一 partial_failed 仓位已在 _exit_active 中，守护协程不重复提交"""
+    db_path = str(tmp_path / "test.db")
+    con = sqlite3.connect(db_path)
+    con.execute("""
+        CREATE TABLE positions (
+            id INTEGER PRIMARY KEY, status TEXT, exchange TEXT,
+            exit_attempt_count INTEGER DEFAULT 0,
+            exit_started_at TEXT, exit_last_attempt_at TEXT
+        )
+    """)
+    con.execute("INSERT INTO positions (id, status, exchange) VALUES (1, 'partial_failed', 'okx')")
+    con.commit()
+    con.close()
+
+    submitted = []
+    async def fake_submit_exit(pos, cfg, path):
+        submitted.append(pos["id"])
+
+    cfg = _mock.MagicMock()
+    cfg.sqlite_path = db_path
+    cfg.exit_monitor_interval_secs = 0.05
+
+    monkeypatch.setattr(_om, "submit_exit", fake_submit_exit)
+    _om._exit_active.add(1)  # 模拟内联循环已在处理
+
+    task = _asyncio.create_task(position_tracker.exit_monitor_loop(cfg))
+    await _asyncio.sleep(0.2)
+    task.cancel()
+    try:
+        await task
+    except _asyncio.CancelledError:
+        pass
+    finally:
+        _om._exit_active.discard(1)
+
+    assert submitted == []  # 不应重复提交
+
+
+# ---------------------------------------------------------------------------
 # Test: no exit triggered when conditions not met
 # ---------------------------------------------------------------------------
 

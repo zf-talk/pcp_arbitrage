@@ -140,6 +140,9 @@ async def _run(cfg_path: str = "config.yaml", web_dashboard_override: str | None
     if cfg.sqlite_path:
         from pcp_arbitrage import position_tracker
         tasks.append(asyncio.create_task(position_tracker.run_position_tracker_loop(cfg)))
+        tasks.append(asyncio.create_task(
+            position_tracker.exit_monitor_loop(cfg),
+        ))
     # Periodic account balance fetch
     async def _balance_fetch_loop():
         import random

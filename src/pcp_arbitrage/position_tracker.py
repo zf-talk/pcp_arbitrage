@@ -61,6 +61,44 @@ async def run_position_tracker_loop(cfg: AppConfig) -> None:
         await _check_positions(cfg)
 
 
+async def exit_monitor_loop(cfg: "AppConfig") -> None:
+    """
+    后台守护：每 exit_monitor_interval_secs 秒扫描一次 partial_failed 仓位，
+    对不在 _exit_active 集合中的仓位重新发起升级平仓流程。
+    """
+    from pcp_arbitrage import order_manager as _om
+    interval = cfg.exit_monitor_interval_secs  # 默认 10s
+    while True:
+        await asyncio.sleep(interval)
+        try:
+            with sqlite3.connect(cfg.sqlite_path) as conn:
+                conn.row_factory = sqlite3.Row
+                rows = conn.execute(
+                    "SELECT * FROM positions WHERE status='partial_failed'"
+                ).fetchall()
+            for row in rows:
+                pid = row["id"]
+                if pid in _om._exit_active:
+                    continue  # 已有内联循环在处理
+
+                logger.info("[exit_monitor] 接管 partial_failed 仓位 %d", pid)
+                _om._exit_active.add(pid)
+
+                async def _run_exit(pos_dict: dict, _pid: int = pid) -> None:
+                    try:
+                        await _om.submit_exit(pos_dict, cfg, cfg.sqlite_path)
+                    finally:
+                        # 无论成功/失败/异常，都清除锁，让下一轮扫描可以重新接管
+                        _om._exit_active.discard(_pid)
+
+                asyncio.create_task(
+                    _run_exit(dict(row)),
+                    name=f"exit_monitor_{pid}",
+                )
+        except Exception as exc:
+            logger.warning("[exit_monitor] 扫描异常: %s", exc)
+
+
 async def _fetch_mark_price(
     session: aiohttp.ClientSession,
     inst_id: str,

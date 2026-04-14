@@ -859,3 +859,54 @@ async def test_escalating_exit_loop_taker_fallback(tmp_path):
     assert filled is True
     assert pnl == 10.0
     assert call_count == 2
+
+
+# ---------------------------------------------------------------------------
+# Tests for account balance capping (Task 5)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_check_and_cap_qty_balance_limit():
+    """当仓位名义价值超过 20%，qty 应被截断"""
+    from pcp_arbitrage import order_manager as om, account_fetcher as af
+    import unittest.mock as mock
+
+    fake_balance = {
+        "total_eq_usdt": 10_000.0,
+        "adj_eq_usdt":   8_000.0,
+    }
+    cfg = mock.MagicMock()
+    cfg.entry_max_trade_pct = 0.20   # 20% of 10000 = 2000 USDT budget
+    cfg.entry_reserve_pct   = 0.10   # 10% of 10000 = 1000 USDT reserve
+
+    with mock.patch.object(af, "get_exchange_balance", return_value=fake_balance):
+        # index=50000, lot_size=0.01
+        # max_qty = min(2000, 8000-1000) / 50000 = 2000/50000 = 0.04
+        result = await om._check_and_cap_qty(
+            qty=0.1,          # 原始深度
+            symbol="BTC",
+            index_price_usdt=50_000.0,
+            exchange_cfg=mock.MagicMock(),
+            app_cfg=cfg,
+            lot_size=0.01,
+        )
+    assert result == pytest.approx(0.04, abs=1e-9)
+
+
+@pytest.mark.asyncio
+async def test_check_and_cap_qty_reserve_insufficient():
+    """可用余额低于预留底线，应返回 0"""
+    from pcp_arbitrage import order_manager as om, account_fetcher as af
+    import unittest.mock as mock
+
+    fake_balance = {"total_eq_usdt": 10_000.0, "adj_eq_usdt": 500.0}  # 低于 1000 预留
+    cfg = mock.MagicMock()
+    cfg.entry_max_trade_pct = 0.20
+    cfg.entry_reserve_pct   = 0.10
+
+    with mock.patch.object(af, "get_exchange_balance", return_value=fake_balance):
+        result = await om._check_and_cap_qty(
+            qty=0.1, symbol="BTC", index_price_usdt=50_000.0,
+            exchange_cfg=mock.MagicMock(), app_cfg=cfg, lot_size=0.01,
+        )
+    assert result == 0.0

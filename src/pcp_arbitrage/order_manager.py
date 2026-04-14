@@ -18,7 +18,7 @@ from pcp_arbitrage import notifier as _notifier
 from pcp_arbitrage.okx_client import _sign, _timestamp
 
 if TYPE_CHECKING:
-    from pcp_arbitrage.config import AppConfig
+    from pcp_arbitrage.config import AppConfig, ExchangeConfig
     from pcp_arbitrage.exchanges.deribit import DeribitRestClient
     from pcp_arbitrage.models import Triplet
     from pcp_arbitrage.pcp_calculator import ArbitrageSignal
@@ -438,6 +438,7 @@ async def _escalating_exit_loop_okx(
 
 
 _SUPPORTED_EXEC_EXCHANGES = {"okx", "deribit"}
+_OKX_EXEC_EXCHANGES = {"okx"}
 
 
 def _okx_fee_type(order_data: dict) -> str | None:
@@ -502,6 +503,60 @@ def _deribit_fee(trades: list[dict]) -> tuple[float | None, str | None]:
     return (total if total != 0.0 else None, ccy)
 
 
+async def _check_and_cap_qty(
+    qty: float,
+    symbol: str,
+    index_price_usdt: float,
+    exchange_cfg: "ExchangeConfig",
+    app_cfg: "AppConfig",
+    lot_size: float,
+    is_paper: bool = False,
+) -> float:
+    """
+    根据账户余额约束截断 qty。
+    - paper 模式下跳过检查（返回原始 qty）
+    - 名义价值 = qty × index_price_usdt
+    - 上限 = total_eq_usdt × entry_max_trade_pct
+    - 预留 = total_eq_usdt × entry_reserve_pct（可用权益必须超过此值）
+    返回调整后的 qty（向下取整到 lot_size）。如果余额不足则返回 0.0。
+    """
+    if is_paper:
+        # paper trading 无真实余额，不做约束
+        return qty
+
+    from pcp_arbitrage import account_fetcher as _af
+
+    bal = await _af.get_exchange_balance(exchange_cfg, app_cfg)
+    if bal is None:
+        logger.warning("[entry_sizing] 无法获取账户余额，跳过余额约束")
+        return qty  # 无法获取时不限制，保持原逻辑
+
+    total_eq = bal.get("total_eq_usdt", 0.0)
+    adj_eq   = bal.get("adj_eq_usdt", 0.0)
+
+    reserve_floor  = total_eq * app_cfg.entry_reserve_pct     # e.g. 10%
+    trade_budget   = total_eq * app_cfg.entry_max_trade_pct   # e.g. 20%
+
+    if adj_eq <= reserve_floor:
+        logger.warning(
+            "[entry_sizing] 可用权益 %.2f USDT ≤ 预留底线 %.2f USDT，跳过开仓",
+            adj_eq, reserve_floor,
+        )
+        return 0.0
+
+    usable = min(trade_budget, adj_eq - reserve_floor)
+    max_qty = usable / index_price_usdt if index_price_usdt > 0 else 0.0
+
+    if max_qty < qty:
+        logger.info(
+            "[entry_sizing] qty %.4f → %.4f（受余额约束: budget=%.2f USDT, index=%.2f）",
+            qty, max_qty, usable, index_price_usdt,
+        )
+
+    capped = math.floor(max_qty / lot_size) * lot_size if lot_size > 0 else max_qty
+    return min(qty, capped)
+
+
 async def submit_entry(
     triplet: "Triplet",
     signal: "ArbitrageSignal",
@@ -559,6 +614,19 @@ async def _submit_entry_inner(
         qty = round(qty, 8)  # strip float precision noise (e.g. 0.30000000000000004 → 0.3)
     if qty <= 0:
         raise RuntimeError(f"[{tag}] 下单数量为零（市场深度不足或不满足最小手数）")
+
+    # --- Check and cap qty by account balance ---
+    qty = await _check_and_cap_qty(
+        qty=qty,
+        symbol=triplet.symbol,
+        index_price_usdt=signal.index_for_fee_usdt,
+        exchange_cfg=exc_cfg,
+        app_cfg=cfg,
+        lot_size=lot_size,
+        is_paper=exc_cfg.is_paper_trading,
+    )
+    if qty <= 0:
+        raise RuntimeError(f"[{tag}] 账户余额不足，跳过开仓")
 
     # --- Guard: block only live open or in-flight opening (partial_failed 可重试) ---
     conn = sqlite3.connect(sqlite_path)
@@ -887,6 +955,19 @@ async def _submit_entry_deribit_inner(
         qty = math.floor(qty / lot_size) * lot_size
     if qty <= 0:
         raise RuntimeError(f"[{tag}] 下单数量为零（市场深度不足或不满足最小手数）")
+
+    # --- Check and cap qty by account balance ---
+    qty = await _check_and_cap_qty(
+        qty=qty,
+        symbol=triplet.symbol,
+        index_price_usdt=signal.index_for_fee_usdt,
+        exchange_cfg=exc_cfg,
+        app_cfg=cfg,
+        lot_size=lot_size,
+        is_paper=exc_cfg.is_paper_trading,
+    )
+    if qty <= 0:
+        raise RuntimeError(f"[{tag}] 账户余额不足，跳过开仓")
 
     # --- Guard: block only live open or in-flight opening ---
     conn = sqlite3.connect(sqlite_path)

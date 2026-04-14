@@ -39,6 +39,7 @@ def _entry_opportunity_tag(triplet: "Triplet", signal: "ArbitrageSignal") -> str
     )
 _POLL_INTERVAL_SEC = 2.0
 _POLL_TIMEOUT_SEC = 30.0
+_TAKER_HARD_TIMEOUT_SEC = 600.0
 _SUBMIT_TIMEOUT_SEC = 30.0
 
 
@@ -121,10 +122,22 @@ async def _poll_order_fill(
     """
     params_str = f"instId={inst_id}&ordId={ord_id}"
     path = f"/api/v5/trade/order?{params_str}"
-    if poll_timeout is not None:
+    if poll_timeout is None:
+        hard_deadline = asyncio.get_event_loop().time() + _TAKER_HARD_TIMEOUT_SEC
+        deadline = None
+    else:
         deadline = asyncio.get_event_loop().time() + poll_timeout
+        hard_deadline = None
     while True:
-        if poll_timeout is not None and asyncio.get_event_loop().time() >= deadline:
+        # Check hard deadline (taker mode: poll_timeout=None)
+        if hard_deadline is not None and asyncio.get_event_loop().time() >= hard_deadline:
+            logger.critical(
+                "_poll_order_fill [%s %s]: taker hard timeout (10min), giving up",
+                inst_id, ord_id,
+            )
+            return None
+        # Check normal deadline (maker mode)
+        if deadline is not None and asyncio.get_event_loop().time() >= deadline:
             return None
         headers = _auth_headers(api_key, secret, passphrase, "GET", path, "", is_paper)
         async with session.get(
@@ -140,8 +153,9 @@ async def _poll_order_fill(
             state = order_data.get("state", "")
             if state == "filled":
                 return order_data
-            if state in ("canceled", "partially_filled"):
+            if state == "canceled":
                 return None
+            # partially_filled: order still active, keep polling
         await asyncio.sleep(poll_interval)
 
 
@@ -319,6 +333,15 @@ async def _escalating_exit_loop_okx(
     maker_chase_secs = cfg.exit_maker_chase_secs
     taker_escalate_secs = cfg.exit_taker_escalate_secs
 
+    # Record the highest existing close order ID before this cycle starts,
+    # so the DB rebuild only looks at orders created in this escalation cycle.
+    with sqlite3.connect(sqlite_path) as _init_conn:
+        _baseline_row = _init_conn.execute(
+            "SELECT COALESCE(MAX(id), 0) FROM orders WHERE position_id=? AND action='close'",
+            (position_id,),
+        ).fetchone()
+        _baseline_order_id = _baseline_row[0] if _baseline_row else 0
+
     remaining = list(failed_legs)
     total_pnl = 0.0
     first_iteration = True
@@ -396,8 +419,8 @@ async def _escalating_exit_loop_okx(
                 _conn.row_factory = sqlite3.Row
                 failed_rows = _conn.execute(
                     "SELECT leg, inst_id, side FROM orders "
-                    "WHERE position_id=? AND action='close' AND status='failed'",
-                    (position_id,),
+                    "WHERE position_id=? AND action='close' AND status='failed' AND id > ?",
+                    (position_id, _baseline_order_id),
                 ).fetchall()
             leg_index = {l["leg"]: l for l in retry_legs}
             db_remaining = [

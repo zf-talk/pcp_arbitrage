@@ -80,6 +80,13 @@ class AppConfig:
     pnl_alert_threshold_pct: float = 0.05  # 5% move triggers Telegram alert
     exit_days_before_expiry: int = 1       # close position N days before expiry
     exit_target_profit_pct: float = 0.50   # close when floating profit >= 50%
+    # 平仓升级重试
+    exit_maker_chase_secs: int = 60        # maker 追单间隔（秒），超时后刷新价格再挂
+    exit_taker_escalate_secs: int = 300    # 总超时（秒）后切换 taker 强平
+    exit_monitor_interval_secs: int = 10   # 后台守护扫描间隔（秒）
+    # 开仓仓位控制
+    entry_max_trade_pct: float = 0.20      # 单笔最多占用账户总权益的比例
+    entry_reserve_pct: float = 0.10        # 账户预留比例（不可动用）
 
     def __post_init__(self):
         if self.log_levels is None:
@@ -163,6 +170,40 @@ def load_config(path: Path | str = "config.yaml") -> AppConfig:
         exit_target_profit_pct = float(arb.get("exit_target_profit_pct", 0.50))
     except (TypeError, ValueError):
         exit_target_profit_pct = 0.50
+    try:
+        exit_maker_chase_secs = int(arb.get("exit_maker_chase_secs", 60))
+    except (TypeError, ValueError):
+        exit_maker_chase_secs = 60
+    if exit_maker_chase_secs < 0:
+        exit_maker_chase_secs = 60
+    try:
+        exit_taker_escalate_secs = int(arb.get("exit_taker_escalate_secs", 300))
+    except (TypeError, ValueError):
+        exit_taker_escalate_secs = 300
+    if exit_taker_escalate_secs < 0:
+        exit_taker_escalate_secs = 300
+    try:
+        exit_monitor_interval_secs = int(arb.get("exit_monitor_interval_secs", 10))
+    except (TypeError, ValueError):
+        exit_monitor_interval_secs = 10
+    if exit_monitor_interval_secs < 0:
+        exit_monitor_interval_secs = 10
+    try:
+        entry_max_trade_pct = float(arb.get("entry_max_trade_pct", 0.20))
+    except (TypeError, ValueError):
+        entry_max_trade_pct = 0.20
+    if entry_max_trade_pct < 0:
+        entry_max_trade_pct = 0.20
+    if entry_max_trade_pct > 1.0:
+        entry_max_trade_pct = 1.0
+    try:
+        entry_reserve_pct = float(arb.get("entry_reserve_pct", 0.10))
+    except (TypeError, ValueError):
+        entry_reserve_pct = 0.10
+    if entry_reserve_pct < 0:
+        entry_reserve_pct = 0.10
+    if entry_reserve_pct > 1.0:
+        entry_reserve_pct = 1.0
     return AppConfig(
         exchanges=exchanges,
         symbols=arb["symbols"],
@@ -192,4 +233,9 @@ def load_config(path: Path | str = "config.yaml") -> AppConfig:
         pnl_alert_threshold_pct=pnl_alert_threshold_pct,
         exit_days_before_expiry=exit_days_before_expiry,
         exit_target_profit_pct=exit_target_profit_pct,
+        exit_maker_chase_secs=exit_maker_chase_secs,
+        exit_taker_escalate_secs=exit_taker_escalate_secs,
+        exit_monitor_interval_secs=exit_monitor_interval_secs,
+        entry_max_trade_pct=entry_max_trade_pct,
+        entry_reserve_pct=entry_reserve_pct,
     )

@@ -185,6 +185,9 @@ def init_db(path: str) -> None:
         _ensure_column(con, "positions", "put_inst_id",    "TEXT")
         _ensure_column(con, "positions", "future_inst_id", "TEXT")
         _ensure_column(con, "positions", "last_error", "TEXT")
+        _ensure_column(con, "positions", "exit_attempt_count",  "INTEGER NOT NULL DEFAULT 0")
+        _ensure_column(con, "positions", "exit_started_at",     "TEXT")
+        _ensure_column(con, "positions", "exit_last_attempt_at","TEXT")
         con.commit()
         # Backfill expected_max_usdt for rows where it is NULL
         con.execute(

@@ -25,6 +25,9 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# 模块级，防止内联循环与守护协程双重操作同一仓位
+_exit_active: set[int] = set()
+
 _OKX_REST_BASE = "https://www.okx.com"
 
 
@@ -110,13 +113,19 @@ async def _poll_order_fill(
     passphrase: str,
     is_paper: bool,
     poll_interval: float = _POLL_INTERVAL_SEC,
-    poll_timeout: float = _POLL_TIMEOUT_SEC,
+    poll_timeout: float | None = _POLL_TIMEOUT_SEC,
 ) -> dict | None:
-    """Poll until order is filled or timeout. Returns order data dict or None on timeout."""
-    deadline = asyncio.get_event_loop().time() + poll_timeout
+    """Poll until order is filled or timeout. Returns order data dict or None on timeout.
+
+    When poll_timeout is None, poll indefinitely until filled or canceled.
+    """
     params_str = f"instId={inst_id}&ordId={ord_id}"
     path = f"/api/v5/trade/order?{params_str}"
-    while asyncio.get_event_loop().time() < deadline:
+    if poll_timeout is not None:
+        deadline = asyncio.get_event_loop().time() + poll_timeout
+    while True:
+        if poll_timeout is not None and asyncio.get_event_loop().time() >= deadline:
+            return None
         headers = _auth_headers(api_key, secret, passphrase, "GET", path, "", is_paper)
         async with session.get(
             "/api/v5/trade/order",
@@ -134,7 +143,6 @@ async def _poll_order_fill(
             if state in ("canceled", "partially_filled"):
                 return None
         await asyncio.sleep(poll_interval)
-    return None
 
 
 async def _cancel_order(
@@ -176,6 +184,7 @@ async def _submit_and_poll_exit_legs_okx(
     passphrase: str,
     is_paper: bool,
     sqlite_path: str,
+    poll_timeout: float | None = _POLL_TIMEOUT_SEC,
 ) -> tuple[bool, float]:
     """Create orders, submit, poll for fills, update DB per-leg.
 
@@ -244,7 +253,8 @@ async def _submit_and_poll_exit_legs_okx(
         fill_results = await asyncio.gather(
             *[_poll_order_fill(sess, inst_id=legs[i]["inst_id"], ord_id=exch_ids[i],
                                api_key=api_key, secret=secret,
-                               passphrase=passphrase, is_paper=is_paper)
+                               passphrase=passphrase, is_paper=is_paper,
+                               poll_timeout=poll_timeout)
               if exch_ids[i] else _noop_fill()
               for i in range(len(legs))],
             return_exceptions=True,
@@ -284,6 +294,126 @@ async def _submit_and_poll_exit_legs_okx(
         conn.close()
 
     return all_filled, pnl
+
+
+async def _escalating_exit_loop_okx(
+    *,
+    session: aiohttp.ClientSession,
+    failed_legs: list[dict],
+    qty: float,
+    position_id: int,
+    signal_id: int | None,
+    api_key: str,
+    secret: str,
+    passphrase: str,
+    is_paper: bool,
+    sqlite_path: str,
+    exit_started_at: float,    # time.monotonic() at first submit
+    cfg: "AppConfig",
+) -> tuple[bool, float]:
+    """
+    Escalating retry for failed exit legs: maker → re-price maker → taker.
+    Returns (all_filled, incremental_pnl).
+    """
+    import time as _time
+    maker_chase_secs = cfg.exit_maker_chase_secs
+    taker_escalate_secs = cfg.exit_taker_escalate_secs
+
+    remaining = list(failed_legs)
+    total_pnl = 0.0
+    first_iteration = True
+
+    while remaining:
+        elapsed = _time.monotonic() - exit_started_at
+        # Always attempt at least one maker round; switch to taker only after
+        # the taker escalation threshold has been reached AND we've already
+        # tried at least one maker round in this loop.
+        use_taker = (not first_iteration) and (elapsed >= taker_escalate_secs)
+        first_iteration = False
+
+        # Cancel stale orders (best effort)
+        for leg in remaining:
+            if leg.get("exch_ord_id"):
+                await _cancel_order(session, inst_id=leg["inst_id"],
+                                    ord_id=leg["exch_ord_id"],
+                                    api_key=api_key, secret=secret,
+                                    passphrase=passphrase, is_paper=is_paper)
+
+        # Refresh prices
+        book_results = await asyncio.gather(
+            *[_fetch_order_book_top(session, leg["inst_id"],
+                                   api_key=api_key, secret=secret,
+                                   passphrase=passphrase, is_paper=is_paper)
+              for leg in remaining],
+            return_exceptions=True,
+        )
+
+        retry_legs = []
+        for i, leg in enumerate(remaining):
+            br = book_results[i]
+            if isinstance(br, Exception) or br is None:
+                bid_px = ask_px = leg["last_px"]
+            else:
+                bid_px, ask_px = br
+            if use_taker:
+                px = ask_px if leg["side"] == "buy" else bid_px
+            else:
+                px = bid_px if leg["side"] == "buy" else ask_px
+            retry_legs.append({**leg, "px": px, "exch_ord_id": None})
+
+        # Update DB attempt tracking
+        with sqlite3.connect(sqlite_path) as _conn:
+            now_iso = _db._utc_now_iso()
+            _conn.execute(
+                "UPDATE positions SET exit_last_attempt_at=?, "
+                "exit_attempt_count = exit_attempt_count + 1 "
+                "WHERE id=?",
+                (now_iso, position_id),
+            )
+
+        # Submit + poll
+        poll_timeout = None if use_taker else maker_chase_secs
+        filled, pnl = await _submit_and_poll_exit_legs_okx(
+            legs=retry_legs,
+            qty=qty,
+            position_id=position_id,
+            signal_id=signal_id,
+            leg_map={l["leg"]: l for l in retry_legs},
+            api_key=api_key, secret=secret, passphrase=passphrase,
+            is_paper=is_paper, sqlite_path=sqlite_path,
+            poll_timeout=poll_timeout,
+        )
+        total_pnl += pnl
+
+        if filled:
+            remaining = []
+        elif use_taker:
+            logger.error("exit_escalating [pos=%d]: taker round failed, giving up", position_id)
+            break
+        else:
+            # Rebuild remaining from DB (source of truth for which legs are still failed)
+            with sqlite3.connect(sqlite_path) as _conn:
+                _conn.row_factory = sqlite3.Row
+                failed_rows = _conn.execute(
+                    "SELECT leg, inst_id, side FROM orders "
+                    "WHERE position_id=? AND action='close' AND status='failed'",
+                    (position_id,),
+                ).fetchall()
+            leg_index = {l["leg"]: l for l in retry_legs}
+            db_remaining = [
+                {**leg_index[r["leg"]], "exch_ord_id": None}
+                for r in failed_rows
+                if r["leg"] in leg_index
+            ]
+            # If DB has no failed rows (e.g. mock context or race), fall back to
+            # retry_legs so we still escalate to taker on the next iteration.
+            remaining = db_remaining if db_remaining else [
+                {**l, "exch_ord_id": None} for l in retry_legs
+            ]
+
+    return len(remaining) == 0, total_pnl
+
+
 _SUPPORTED_EXEC_EXCHANGES = {"okx", "deribit"}
 
 
@@ -1201,6 +1331,8 @@ async def _submit_exit_inner(
     cfg: "AppConfig",
     sqlite_path: str,
 ) -> None:
+    import time as _time
+    _exit_submit_start = _time.monotonic()
     exchange_name = str(position.get("exchange", "OKX"))
     exc_cfg = cfg.exchanges.get(exchange_name.upper()) or cfg.exchanges.get(exchange_name.lower())
     if exc_cfg is None:
@@ -1443,44 +1575,49 @@ async def _submit_exit_inner(
     finally:
         conn.close()
 
-    # --- Auto-retry: one attempt for failed legs, 2 seconds later ---
+    # --- Escalating exit retry loop ---
     if not all_filled:
-        failed_indices = [i for i in range(3) if filled_data[i] is None]
-        logger.info("[submit_exit] pos=%d 局部失败，2s 后自动重试 %d 腿: %s",
-                    position_id, len(failed_indices),
-                    [exit_legs[i]["leg"] for i in failed_indices])
-        await asyncio.sleep(2.0)
-
-        # Re-fetch passive prices for the failed legs
-        async with aiohttp.ClientSession(base_url=_OKX_REST_BASE) as sess_r:
-            retry_books = await asyncio.gather(
-                *[_fetch_order_book_top(sess_r, exit_legs[i]["inst_id"],
-                                       api_key=api_key, secret=secret,
-                                       passphrase=passphrase, is_paper=is_paper)
-                  for i in failed_indices],
-                return_exceptions=True,
+        now_iso = _db._utc_now_iso()
+        with sqlite3.connect(sqlite_path) as _conn:
+            _conn.execute(
+                "UPDATE positions SET "
+                "exit_started_at = COALESCE(exit_started_at, ?), "
+                "exit_attempt_count = exit_attempt_count + 1, "
+                "exit_last_attempt_at = ? "
+                "WHERE id=?",
+                (now_iso, now_iso, position_id),
             )
-
-        retry_legs = []
-        for j, i in enumerate(failed_indices):
-            orig = exit_legs[i]
-            book = retry_books[j]
-            if isinstance(book, Exception) or book == (None, None):
-                px = orig["px"]
-            else:
-                bid, ask = book
-                px = bid if orig["side"] == "buy" else ask  # passive maker
-            retry_legs.append({**orig, "px": px})
-
-        retry_filled, retry_pnl = await _submit_and_poll_exit_legs_okx(
-            legs=retry_legs, qty=qty, position_id=position_id,
-            signal_id=position.get("signal_id"), leg_map=leg_map,
-            api_key=api_key, secret=secret, passphrase=passphrase, is_paper=is_paper,
-            sqlite_path=sqlite_path,
-        )
-        if retry_filled:
-            all_filled = True
-            realized_pnl += retry_pnl
+        _exit_active.add(position_id)
+        try:
+            failed_legs = [
+                {
+                    "leg": exit_legs[i]["leg"],
+                    "inst_id": exit_legs[i]["inst_id"],
+                    "side": exit_legs[i]["side"],
+                    "entry_px": 0.0,
+                    "oid_db": exit_order_ids_db[i],
+                    "last_px": exit_legs[i]["px"],
+                    "exch_ord_id": exch_order_ids[i],
+                }
+                for i in range(len(exit_legs)) if filled_data[i] is None
+            ]
+            async with aiohttp.ClientSession(base_url=_OKX_REST_BASE) as _loop_sess:
+                loop_filled, loop_pnl = await _escalating_exit_loop_okx(
+                    session=_loop_sess,
+                    failed_legs=failed_legs,
+                    qty=qty,
+                    position_id=position_id,
+                    signal_id=position.get("signal_id"),
+                    api_key=api_key, secret=secret, passphrase=passphrase,
+                    is_paper=is_paper, sqlite_path=sqlite_path,
+                    exit_started_at=_exit_submit_start,
+                    cfg=cfg,
+                )
+            if loop_filled:
+                all_filled = True
+                realized_pnl += loop_pnl
+        finally:
+            _exit_active.discard(position_id)
 
     # --- Update position status ---
     conn = sqlite3.connect(sqlite_path)
@@ -1521,6 +1658,8 @@ async def _submit_exit_deribit_inner(
     cfg: "AppConfig",
     sqlite_path: str,
 ) -> None:
+    import time as _time
+    _exit_submit_start = _time.monotonic()  # noqa: F841 — reserved for future escalating loop
     from pcp_arbitrage.exchanges.deribit import DeribitRestClient, _internal_to_deribit
     from pcp_arbitrage.pcp_calculator import DERIBIT_INVERSE_FUT_USD_FACE
 
@@ -1751,16 +1890,30 @@ async def _submit_exit_deribit_inner(
             logger.warning("submit_exit deribit: telegram notification failed: %s", exc)
     else:
         reason = "one or more exit orders did not fill within timeout"
-        _update_exit_failed(
-            sqlite_path, position_id, exit_order_ids_db,
-            reason="平仓单未在时限内全部成交",
-        )
-        await _send_exit_failure_telegram(cfg, position, reason)
-        async with DeribitRestClient(api_key=api_key, secret=secret) as dclient2:
-            await dclient2._authenticate()
-            for i, fr in enumerate(fill_results):
-                if (isinstance(fr, Exception) or fr is None) and exch_order_ids[i]:
-                    await dclient2.cancel_order(exch_order_ids[i])  # type: ignore[arg-type]
+        now_iso = _db._utc_now_iso()
+        with sqlite3.connect(sqlite_path) as _conn:
+            _conn.execute(
+                "UPDATE positions SET "
+                "exit_started_at = COALESCE(exit_started_at, ?), "
+                "exit_attempt_count = exit_attempt_count + 1, "
+                "exit_last_attempt_at = ? "
+                "WHERE id=?",
+                (now_iso, now_iso, position_id),
+            )
+        _exit_active.add(position_id)
+        try:
+            _update_exit_failed(
+                sqlite_path, position_id, exit_order_ids_db,
+                reason="平仓单未在时限内全部成交",
+            )
+            await _send_exit_failure_telegram(cfg, position, reason)
+            async with DeribitRestClient(api_key=api_key, secret=secret) as dclient2:
+                await dclient2._authenticate()
+                for i, fr in enumerate(fill_results):
+                    if (isinstance(fr, Exception) or fr is None) and exch_order_ids[i]:
+                        await dclient2.cancel_order(exch_order_ids[i])  # type: ignore[arg-type]
+        finally:
+            _exit_active.discard(position_id)
 
 
 def _update_exit_failed(

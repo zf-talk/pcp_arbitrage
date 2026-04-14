@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import sqlite3
+from unittest import mock
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -814,3 +815,47 @@ class TestExchangeRouting:
         fut_amount = round(qty * future_price / contract_size) * contract_size
         assert fut_amount == 24000.0
 
+
+@pytest.mark.asyncio
+async def test_escalating_exit_loop_taker_fallback(tmp_path):
+    """maker 超时后，升级到 taker 成功平仓"""
+    import time
+    from pcp_arbitrage import order_manager as om
+
+    cfg = mock.MagicMock()
+    cfg.exit_maker_chase_secs = 1
+    cfg.exit_taker_escalate_secs = 2
+
+    call_count = 0
+
+    async def fake_submit_and_poll(**kwargs):
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            return False, 0.0
+        return True, 10.0
+
+    with mock.patch.object(om, "_submit_and_poll_exit_legs_okx", side_effect=fake_submit_and_poll), \
+         mock.patch.object(om, "_cancel_order", return_value=None), \
+         mock.patch.object(om, "_fetch_order_book_top", return_value=(100.0, 101.0)):
+        started_at = time.monotonic() - 2.5
+        # Need to init DB for the function to query
+        import sqlite3
+        con = sqlite3.connect(str(tmp_path / "test.db"))
+        con.execute("CREATE TABLE positions (id INTEGER PRIMARY KEY, exit_attempt_count INTEGER DEFAULT 0, exit_last_attempt_at TEXT)")
+        con.execute("CREATE TABLE orders (id INTEGER PRIMARY KEY, position_id INTEGER, action TEXT, status TEXT, leg TEXT, inst_id TEXT, side TEXT)")
+        con.commit()
+        con.close()
+
+        filled, pnl = await om._escalating_exit_loop_okx(
+            session=mock.AsyncMock(),
+            failed_legs=[{"leg": "call", "inst_id": "BTC-USD-C", "side": "sell",
+                          "entry_px": 90.0, "oid_db": 1, "last_px": 100.0, "exch_ord_id": None}],
+            qty=0.01, position_id=1, signal_id=None,
+            api_key="k", secret="s", passphrase="p", is_paper=True,
+            sqlite_path=str(tmp_path / "test.db"),
+            exit_started_at=started_at, cfg=cfg,
+        )
+    assert filled is True
+    assert pnl == 10.0
+    assert call_count == 2

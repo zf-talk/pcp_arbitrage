@@ -75,6 +75,8 @@
 - **追踪**：`opportunity_csv_*`、`pairing_log_dir`、`sqlite_path`。
 - **Web**：`web_dashboard_*`。
 - **风控与平仓**：`pnl_alert_threshold_pct`、`exit_days_before_expiry`、`exit_target_profit_pct`（持仓跟踪与平仓逻辑使用）。
+- **平仓升级重试**：`exit_maker_chase_secs`（maker 追单间隔，默认 60s）、`exit_taker_escalate_secs`（切 taker 总超时，默认 300s）、`exit_monitor_interval_secs`（守护协程扫描间隔，默认 10s）。
+- **开仓仓位控制**：`entry_max_trade_pct`（单笔最多占账户总权益比例，默认 20%）、`entry_reserve_pct`（账户预留底线，默认 10%）。
 - **交易所**：`ExchangeConfig` 含 `arbitrage_enabled`、API 凭证、`margin_type`（影响期货保证金标签：币本位 `USD` / U 本位 `USDT` / USDC 等）。
 
 各字段来源见 `config.py` 与仓库中的 `config.yaml.example`（勿将真实密钥提交版本库）。
@@ -111,13 +113,14 @@
 | `run_web_dashboard_loop` | HTTP + WebSocket 推送 JSON 给浏览器 |
 | `run_startup_revalidation_loop` | 屏障解除后执行各所 `startup_market_sweep`，校正从 DB 恢复的「伪活跃」行 |
 | `run_position_tracker_loop` | 周期性检查持仓与盈亏，触发告警或 `submit_exit` |
+| `exit_monitor_loop` | 每 10s 扫描 `partial_failed` 仓位，自动接管并重试升级平仓 |
 
 ---
 
 ## 5. 自动交易与风控（概要）
 
-- **开仓**：`order_manager.submit_entry` 面向 **OKX** REST：三腿限价并行提交、轮询成交、SQLite 记录 `positions` / `orders`。重复同合约同方向未平仓头寸会跳过。
-- **平仓**：`submit_exit` 读取开仓订单与当前盘口，下反向三腿；`position_tracker` 在浮盈或临近到期等条件下可调用。
+- **开仓**：`order_manager.submit_entry` 面向 **OKX / Deribit** REST：三腿限价并行提交、轮询成交、SQLite 记录 `positions` / `orders`。重复同合约同方向未平仓头寸会跳过。开仓前通过 `_check_and_cap_qty` 按账户余额约束下单量（默认最多 20%，预留 10%）。
+- **平仓**：`submit_exit` 读取开仓订单与当前盘口，下反向三腿；`position_tracker` 在浮盈或临近到期等条件下可调用。平仓失败时进入升级重试循环（maker→追单→taker），如有腿始终未成交则标记 `partial_failed`，由 `exit_monitor_loop` 守护协程自动接管重试。
 - **`arbitrage_enabled`**：在 `ExchangeConfig` 与 Web 载荷中标识「是否允许自动套利」意图；**若需用该开关硬关下单，应在调用链上增加显式判断**（与仅监控场景区分）。
 
 ---
@@ -138,9 +141,13 @@ erDiagram
         text expiry
         real strike
         text direction
-        text status
+        text status "open/closing/closed/partial_failed"
         text opened_at
         text closed_at
+        real realized_pnl_usdt
+        int exit_attempt_count "平仓尝试次数"
+        text exit_started_at "首次发起平仓时间"
+        text exit_last_attempt_at "最近一次尝试时间"
     }
     orders {
         int id PK

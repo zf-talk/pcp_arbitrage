@@ -165,7 +165,6 @@ class OKXRunner:
             api_key=ex.api_key,
             secret=ex.secret_key,
             passphrase=ex.passphrase,
-            is_paper=ex.is_paper_trading,
         ) as rest:
             # 1. Fetch fee rates
             logger.info("[okx] Fetching fee rates...")
@@ -379,11 +378,7 @@ class OKXRunner:
             ws_args = _build_ws_args(triplets)
             idx_args = _build_index_ticker_args(symbols)
             logger.info("[okx] Subscribing to %d channels + %d index tickers", len(ws_args), len(idx_args))
-            ws_url = (
-                "wss://wspap.okx.com:8443/ws/v5/public?brokerId=9999"
-                if ex.is_paper_trading
-                else "wss://ws.okx.com:8443/ws/v5/public"
-            )
+            ws_url = "wss://ws.okx.com:8443/ws/v5/public"
             ws_client = OKXWebSocketClient(ws_url, on_message=on_message, on_reconnect=on_reconnect)
             ws_client.add_subscriptions(ws_args + idx_args)
             if dashboard_enabled():

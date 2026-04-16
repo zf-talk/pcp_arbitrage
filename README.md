@@ -136,26 +136,22 @@ cp config.yaml.example config.yaml   # then fill in your keys
 exchanges:
   okx:
     enabled: true
-    margin_type: coin        # coin = BTC/ETH settled
     api_key: "..."
     secret_key: "..."
     passphrase: "..."        # OKX only
 
   binance:
     enabled: false
-    margin_type: usdt
     api_key: "..."
     secret_key: "..."
 
   deribit:
     enabled: false
-    margin_type: coin
     api_key: "..."           # client_id
     secret_key: "..."        # client_secret
 
   deribit_linear:
     enabled: false
-    margin_type: usdc
     api_key: "..."           # same client_id as deribit
     secret_key: "..."        # same client_secret as deribit
 
@@ -166,8 +162,6 @@ arbitrage:
     - BTC
     - ETH
   stale_threshold_ms: 5000
-  signal_ui: classic           # classic = multi-line print; dashboard = top-like table (TTY only)
-  signal_dashboard_max_rows: 30
 ```
 
 ### Underlyings (`symbols`)
@@ -176,12 +170,7 @@ arbitrage:
 
 **Lot sizes** for fee/signal math use built-in defaults (`DEFAULT_LOT_SIZES` in `config.py`). Override per symbol only if needed: `contracts: { lot_size: { BTC: 0.02 } }`.
 
-### Signal UI (`signal_ui`)
-
-- **`classic` (default)** — print full multi-line detail whenever annualized return is above the threshold.
-- **`dashboard`** — refresh a `top`-like table on **interactive TTY** stdout. A row turns **`inactive` only after a new tick recomputes that triplet+direction and the result is below threshold** (or missing). It is **not** time-based: if an opportunity stays valid but no leg updates for a while, the row may remain **active** until any leg moves and triggers a recompute.
-
-The dashboard uses **[Rich](https://github.com/Textualize/rich)** `Live` with a `Table` (`screen=True` uses the alternate buffer). Redraws stay off normal scrollback; Rich restores the terminal on exit. With **`dashboard_quiet_exchanges: true`** (default), `pcp_arbitrage.exchanges` and `okx_client` log at **WARNING** to cut stderr noise; set it to `false` or override per logger under `logging.levels` for debugging.
+With **`dashboard_quiet_exchanges: true`** (default), `pcp_arbitrage.exchanges` and `okx_client` log at **WARNING** to cut stderr noise while dashboards are active; set it to `false` or override per logger under `logging.levels` for debugging.
 
 ## Run
 

@@ -10,6 +10,7 @@ from pcp_arbitrage.pcp_calculator import ArbitrageSignal
 
 def _t() -> Triplet:
     return Triplet(
+        exchange="okx",
         symbol="BTC",
         expiry="261225",
         strike=56000.0,
@@ -154,6 +155,32 @@ def test_inactive_freezes_values_until_reactivated():
     assert r.gross == pytest.approx(888.0)
     assert r.fee == pytest.approx(8.88)
     assert r.ann_pct == pytest.approx(30.0)
+
+
+def test_near_duplicate_strikes_merge_to_one_row():
+    """行权价浮点差异但展示合约相同（如 74500 vs 74500+ε）时只保留一行，避免重复日志/会话。"""
+    d = OpportunityDashboard(max_rows=10)
+    t1 = Triplet(
+        exchange="okx",
+        symbol="BTC",
+        expiry="260417",
+        strike=74500.0,
+        call_id="c1",
+        put_id="p1",
+        future_id="f1",
+    )
+    t2 = Triplet(
+        exchange="okx",
+        symbol="BTC",
+        expiry="260417",
+        strike=74500.00000000093,
+        call_id="c1",
+        put_id="p1",
+        future_id="f1",
+    )
+    d.record_evaluation("okx", t1, "reverse", _sig(t1, ann=0.10), 0.01)
+    d.record_evaluation("okx", t2, "reverse", _sig(t2, ann=0.10), 0.01)
+    assert len(d._rows) == 1
 
 
 def test_inactive_edge_immediate_upsert_current(monkeypatch):

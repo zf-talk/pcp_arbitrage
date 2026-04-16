@@ -1,57 +1,54 @@
 exchanges:
   okx:
     enabled: true
-    arbitrage_enabled: false  # 是否开启自动套利交易（需配置 api_key）
-    margin_type: coin        # coin = BTC/ETH settled; usdt = USDT settled
     api_key: ""
     secret_key: ""
     passphrase: ""
-    is_paper_trading: false
 
   binance:
     enabled: false
-    margin_type: usdt
     api_key: ""
     secret_key: ""
 
   deribit:
     enabled: false
-    margin_type: coin
-    api_key: ""              # client_id
-    secret_key: ""           # client_secret
+    api_key: ""              # 对应 deribit 的 client_id
+    secret_key: ""           # 对应 deribit 的 client_secret
 
   deribit_linear:
     enabled: false
-    margin_type: usdc
-    api_key: ""              # same client_id as deribit
-    secret_key: ""           # same client_secret as deribit
+    api_key: ""              # 与 deribit 共用同一个 client_id
+    secret_key: ""           # 与 deribit 共用同一个 client_secret
 
 arbitrage:
-  min_annualized_rate: 0.010  # minimum annualized return to print signal (1%)
-  order_min_annualized_rate: 0.05   # send Telegram alert when ann_rate >= this (must be > min_annualized_rate)
-  atm_range: 0.20             # filter strikes within ±20% of spot price
-  min_days_to_expiry: 1.0     # skip options with T below this (days); 0 = allow any positive T
+  min_annualized_rate: 0.010  # 打印信号的最低年化收益率（1%）
+  order_min_annualized_rate: 0.05   # 当年化 >= 该值时发送 Telegram 告警（应大于 min_annualized_rate）
+  dashboard_quiet_exchanges: true   # 仅 dashboard：减少 exchanges/okx_client 在 stderr 的 INFO 噪声
+  entry_max_trade_pct: 0.20   # 单笔交易最多占账户权益的比例
+  entry_reserve_pct: 0.10     # 账户最少保留比例（不参与开仓）
+  exit_days_before_expiry: 1         # 距离期权到期 N 天时自动平仓
+  exit_target_profit_pct: 0.50       # 浮盈达到 50% 时自动平仓
+  atm_range: 0.20             # 仅保留距离现货价格 ±20% 范围内的行权价
+  min_days_to_expiry: 1.0     # 跳过剩余到期天数低于该值的期权；0 表示允许任意正 T
+  maker_chase_secs: 60               # 开/平仓每轮 maker 追单时长（秒）；超时后切换 taker
+  maker_chase_max_minutes: 3         # 开/平仓连续追单总时长上限（分钟）
+  stale_threshold_ms: 5000            # 忽略超过 5 秒的旧盘口快照
+  
   # 监控列表；各所仅处理其支持的子集（见 README）：OKX/Deribit 币本位 = BTC+ETH；
   # Binance 另支持 BNB SOL XRP DOGE；Deribit Linear 另支持 AVAX SOL TRX XRP
   symbols:
     - BTC
     - ETH
-  stale_threshold_ms: 5000    # ignore order book snapshots older than 5s
-  signal_ui: classic          # classic = multi-line print; dashboard = top-like table (TTY only)
-  signal_dashboard_max_rows: 30
-  dashboard_quiet_exchanges: true   # dashboard only: less INFO from exchanges/okx_client on stderr (scrollback)
-  exit_days_before_expiry: 1         # auto-exit N days before option expiry
-  exit_target_profit_pct: 0.50       # auto-exit when floating profit >= 50%
 
-# Pairing summary: one file per exchange, overwritten each run; + periodic CSV of opportunities
+# 配对结果追踪：每个交易所一个文件，每次运行覆盖；另可周期写机会 CSV
 tracing:
   pairing_log_dir: data/pairings
   opportunity_csv_enabled: true
   opportunity_csv_path: data/opportunities.csv
   opportunity_csv_interval_sec: 5
-  sqlite_path: data/pcp_arbitrage.db   # SQLite for triplets + opportunity snapshots; empty string to disable
+  sqlite_path: data/pcp_arbitrage.db   # 用于 triplet 与机会快照的 SQLite；留空字符串则禁用
 
-# proxy: "http://127.0.0.1:7897"   # uncomment and set if Binance is geo-restricted
+# proxy: "http://127.0.0.1:7897"   # 若 Binance 存在地域限制，可取消注释并设置代理
 
 # Web dashboard: HTML 机会表格 + 组合列表，通过浏览器访问。
 # 启动后打开 http://127.0.0.1:8765
@@ -59,14 +56,14 @@ web_dashboard:
   enabled: true
   host: "0.0.0.0"     # 监听所有接口；仅本机访问可改为 127.0.0.1
   port: 8765
-  width: 220           # 保留字段（内部用），HTML 模式下不影响显示
+  # api_base: "/pcp"  # 可选：页面挂在反向代理子路径时，前端请求 /pcp/api/...；直连 aiohttp 留空或省略
 
 logging:
-  level: INFO                              # global log level
-  tick_interval_sec: 0                     # Deribit: periodic DEBUG every N sec while WS runs (0 = off)
+  level: INFO                              # 全局日志级别
+  tick_interval_sec: 0                     # Deribit：WS 运行时每 N 秒打印一次 DEBUG（0 = 关闭）
   levels:
-    pcp_arbitrage.exchanges.binance: DEBUG  # per-module override
+    pcp_arbitrage.exchanges.binance: DEBUG  # 按模块覆盖日志级别
 
 telegram:
-  bot_token: ""    # BotFather token, e.g. "123456:ABC..."
-  chat_id: ""      # Your chat/group ID, e.g. "-1001234567890"
+  bot_token: ""    # BotFather 生成的 token，例如 "123456:ABC..."
+  chat_id: ""      # 你的聊天/群组 ID，例如 "-1001234567890"

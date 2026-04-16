@@ -3,6 +3,14 @@
 <head>
 <meta charset="utf-8"/>
 <title>PCP Arbitrage Dashboard</title>
+<script>
+window.__PCP_API_BASE__ = {{ pcp_api_base|tojson }};
+function pcpApiUrl(path) {
+  const b = String(window.__PCP_API_BASE__ || '').replace(/\/$/, '');
+  const p = path.startsWith('/') ? path : '/' + path;
+  return b + p;
+}
+</script>
 <style>
   * { box-sizing: border-box; margin: 0; padding: 0; }
 
@@ -330,8 +338,39 @@
   .orders-subtable .o-filled { color: var(--green); }
   .orders-subtable .o-pending { color: var(--yellow); }
   .orders-subtable .o-failed { color: var(--red); }
+  .orders-subtable .order-err-icon {
+    display: inline-flex; align-items: center; justify-content: center;
+    margin-left: 4px; padding: 0 3px; min-width: 20px; height: 20px;
+    border: none; border-radius: 4px; background: transparent;
+    color: var(--text-muted); cursor: pointer; font-size: 13px; vertical-align: middle;
+    line-height: 1;
+  }
+  .orders-subtable .order-err-icon.err { color: var(--red); }
+  .orders-subtable .order-err-icon.info { color: var(--text-muted); }
+  .orders-subtable .order-err-icon:hover { background: var(--bg2); }
+  .orders-subtable .order-err-icon.err:hover { color: var(--red); }
+  .orders-subtable .order-err-icon.info:hover { color: var(--accent2); }
   .orders-subtable .o-act-open { color: var(--text-dim); }
   .orders-subtable .o-act-close { color: var(--purple); }
+  .orders-subtable .o-liq-taker { color: var(--orange, #e5984a); font-weight: 600; }
+  .orders-subtable .o-liq-maker { color: var(--accent2); font-weight: 600; }
+  .orders-subtable td.o-cell-split {
+    vertical-align: top;
+    padding-top: 6px;
+    padding-bottom: 6px;
+    line-height: 1.35;
+  }
+  .orders-subtable td.o-cell-split .o-stack-r {
+    display: flex;
+    flex-direction: column;
+    align-items: flex-end;
+    gap: 3px;
+    line-height: 1.3;
+  }
+  .orders-subtable td.o-cell-split .o-stack-r .o-sub {
+    font-size: 11px;
+    color: var(--text-muted);
+  }
 
   /* ── 历史机会：统计 + 折线图 ───────────────────────────────────────── */
   #history-overview {
@@ -586,6 +625,28 @@
   .order-btn-pending { background: #6b7280; color: #fff; cursor: not-allowed; }
   .order-btn-auto    { background: #d97706; color: #fff; cursor: not-allowed; }
   .order-btn-done    { background: #374151; color: #9ca3af; cursor: not-allowed; }
+  .order-status.ordering {
+    display: inline-block;
+    padding: 2px 8px;
+    border-radius: 3px;
+    background: rgba(229, 192, 123, 0.2);
+    color: var(--yellow);
+    font-weight: 600;
+    font-family: sans-serif;
+    font-size: 11px;
+    cursor: wait;
+  }
+  .order-status.flash-ok {
+    display: inline-block;
+    padding: 2px 8px;
+    border-radius: 3px;
+    background: rgba(78, 201, 176, 0.15);
+    color: var(--green);
+    font-weight: 600;
+    font-family: sans-serif;
+    font-size: 11px;
+  }
+  .col-status.c-ordering { color: var(--yellow); font-weight: 600; font-family: sans-serif; }
   .toast {
     background: #1a1a2e;
     color: #e0e0e0;
@@ -682,6 +743,13 @@
   }
   .pos-retry-btn:hover:not(:disabled) { background: var(--accent2); color: #fff; }
   .pos-retry-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+  .pos-leg-close-btn {
+    padding: 1px 6px; font-size: 11px; border-radius: 4px; cursor: pointer;
+    border: 1px solid var(--accent); background: transparent; color: var(--accent);
+    white-space: nowrap;
+  }
+  .pos-leg-close-btn:hover:not(:disabled) { background: var(--accent); color: #fff; }
+  .pos-leg-close-btn:disabled { opacity: 0.55; cursor: not-allowed; }
 </style>
 </head>
 <body>
@@ -730,7 +798,7 @@
           <th class="r col-pnl-trio">价差</th>
           <th class="r col-pnl-trio">手续费</th>
           <th class="r col-pnl-trio">净利</th>
-          <th class="r col-pnl-trio">深度</th>
+          <th class="r col-pnl-trio">可交易量(张)</th>
           <th class="r col-pnl-trio" id="th-expected-max">预期最大收益</th>
           <th class="r col-pnl-trio" id="th-ann">当前年化 / 时长</th>
           <th class="r" id="th-hist-ann">历史最大年化 / 时长</th>
@@ -773,9 +841,9 @@
             <div class="formula-line" style="margin-left:8px">
               <span class="fop">价差 = call_bid + K − put_ask − future_ask</span></div>
             <div class="formula-line" style="margin-top:8px"><span class="fl">预期最大收益</span>
-              <span class="fop"> = 净利 × 深度 &nbsp;(USDT)</span></div>
+              <span class="fop"> = 净利 × 可交易量(张) &nbsp;(USDT)</span></div>
             <div class="formula-line" style="margin-left:8px;font-size:10px;color:var(--text-muted)">
-              深度 = 三腿对手盘最优档挂量之最小（与上表「深度」列一致）</div>
+              可交易量(张) = 三腿对手盘最优档挂量之最小（与下方「深度（手）」一致）</div>
             <div class="formula-line" style="margin-top:6px"><span class="fl">年化</span>
               <span class="fop"> = (价差 − 6腿手续费) / 保证金 × (365 / 到期天数)</span></div>
             <div class="formula-line" style="margin-left:8px;font-size:10px;color:var(--text-muted)">
@@ -819,7 +887,7 @@
           <th class="r col-pnl-trio">价差</th>
           <th class="r col-pnl-trio">手续费</th>
           <th class="r col-pnl-trio">净利</th>
-          <th class="r col-pnl-trio">深度</th>
+          <th class="r col-pnl-trio">可交易量(张)</th>
           <th class="r col-pnl-trio">预计最大</th>
           <th class="r col-pnl-trio">年化%</th>
           <th class="r">开始时间</th>
@@ -922,8 +990,59 @@ setInterval(checkAutoTheme, 60000);
 // ── Tabs ────────────────────────────────────────────────────────────────────
 let _lastPositions = [];
 let _lastPositionsJson = '';
-/** @type {Record<number, string>} */
-let _positionLastError = {};
+
+/** 仓位级或子订单级错误文案（用于持仓表展示） */
+function positionErrorSummary(p) {
+  if (!p) return '';
+  if (p.last_error != null && String(p.last_error).trim() !== '') {
+    return String(p.last_error);
+  }
+  const orders = p.orders || [];
+  const lines = [];
+  for (const o of orders) {
+    if (o.last_error != null && String(o.last_error).trim() !== '') {
+      lines.push(String(o.last_error));
+    }
+  }
+  if (lines.length === 0) return '';
+  const uniq = [...new Set(lines)];
+  return uniq.join('\n');
+}
+
+function openPositionError(posId) {
+  const p = (_lastPositions || []).find(x => x.id === posId);
+  const text = positionErrorSummary(p);
+  if (!text) return;
+  const titleEl = document.getElementById('pos-err-title');
+  const sub = document.getElementById('pos-err-sub');
+  const body = document.getElementById('pos-err-body');
+  const ov = document.getElementById('pos-err-overlay');
+  if (titleEl) titleEl.textContent = '仓位错误详情';
+  if (sub) sub.textContent = '仓位 #' + posId;
+  if (body) body.textContent = text;
+  if (ov) ov.classList.add('open');
+}
+
+function openOrderError(positionId, orderId) {
+  const p = (_lastPositions || []).find(x => String(x.id) === String(positionId));
+  const o = p && (p.orders || []).find(ord => String(ord.id) === String(orderId));
+  const text = o && o.last_error != null ? String(o.last_error).trim() : '';
+  if (!text) return;
+  const titleEl = document.getElementById('pos-err-title');
+  const sub = document.getElementById('pos-err-sub');
+  const body = document.getElementById('pos-err-body');
+  const ov = document.getElementById('pos-err-overlay');
+  if (titleEl) titleEl.textContent = '订单错误详情';
+  if (sub) sub.textContent = '仓位 #' + positionId + ' · 订单 #' + orderId;
+  if (body) body.textContent = text;
+  if (ov) ov.classList.add('open');
+}
+
+function closePositionError() {
+  const ov = document.getElementById('pos-err-overlay');
+  if (ov) ov.classList.remove('open');
+}
+
 function _activateTab(panel) {
   document.querySelectorAll('.tab').forEach(t => t.classList.toggle('active', t.dataset.panel === panel));
   document.querySelectorAll('.panel').forEach(p => p.classList.toggle('active', p.id === panel));
@@ -1120,6 +1239,10 @@ function fmtUtcIsoToLocal(s) {
     return escHtml(s);
   }
 }
+function fmtPositionStatus(raw) {
+  const s = String(raw || '');
+  return s === 'partial_failed' ? 'partial_success' : s;
+}
 function parseIsoUnixSec(s) {
   if (!s) return null;
   let iso = String(s).trim();
@@ -1138,17 +1261,30 @@ let _historyPage = 0;
 // ── 手动下单 ──────────────────────────────────────────────────────────────────
 // 记录正在下单中的 key，防止重复点击
 const _orderingKeys = new Set();
+/** 下单结果短时展示（约 8s 后清除） */
+const _orderResultFlash = new Map();
 
 /** 生成下单按钮 HTML。
- *  - has_position / 自动下单中 / 手动下单中：不显示按钮
- *  - 其他：始终显示可点击"下单"按钮
+ *  - has_position：不显示
+ *  - 自动将达阈值：不显示
+ *  - 手动下单中：显示「下单中…」
+ *  - 刚返回成功：短时显示「✓ 已提交」
+ *  - 其他：显示「下单」
  */
 function fmtOrderBtn(r) {
   const key = r.exchange + '\0' + r.label + '\0' + r.direction;
   if (r.has_position) return '';
   const orderMinAnn = (_lastMeta && _lastMeta.order_min_ann != null) ? _lastMeta.order_min_ann * 100 : null;
   if (r.active && orderMinAnn != null && r.ann_pct >= orderMinAnn) return '';
-  if (_orderingKeys.has(key)) return '';
+  if (_orderingKeys.has(key)) {
+    return '<span class="order-status ordering" title="正在向交易所提交订单…">下单中…</span>';
+  }
+  if (_orderResultFlash.has(key)) {
+    const fr = _orderResultFlash.get(key);
+    if (fr.ok) {
+      return '<span class="order-status flash-ok" title="订单已提交">✓ 已提交</span>';
+    }
+  }
   return '<button class="order-btn order-btn-manual"' +
     ' data-exchange="' + escHtml(r.exchange) + '"' +
     ' data-label="' + escHtml(r.label) + '"' +
@@ -1160,25 +1296,33 @@ async function submitManualOrder(exchange, label, direction) {
   const key = exchange + '\0' + label + '\0' + direction;
   if (_orderingKeys.has(key)) return;
   _orderingKeys.add(key);
-  // Re-render table to immediately show "下单中…" state
+  _orderResultFlash.delete(key);
   if (_cachedOppRows !== null) renderOppTable();
   try {
-    const resp = await fetch('/api/manual-entry', {
+    const resp = await fetch(pcpApiUrl('/api/manual-entry'), {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
       body: JSON.stringify({exchange, label, direction}),
     });
-    const data = await resp.json();
-    if (!resp.ok || !data.ok) {
-      // Show error toast and re-enable button
-      showToast({type: 'order_error', label, exchange, message: data.error || ('HTTP ' + resp.status)});
-      _orderingKeys.delete(key);
-    }
-    // On success: keep key in _orderingKeys (button stays disabled);
-    // success toast and has_position update arrive via WS broadcast
-  } catch (e) {
-    showToast({type: 'order_error', label, exchange, message: '请求异常: ' + e});
+    let data = {};
+    try {
+      data = await resp.json();
+    } catch (_) { /* empty body */ }
     _orderingKeys.delete(key);
+    if (resp.ok && data.ok) {
+      _orderResultFlash.set(key, { ok: true, t: Date.now() });
+    } else {
+      const err = data.error || ('HTTP ' + resp.status);
+      _orderResultFlash.set(key, { ok: false, t: Date.now() });
+      // submit_entry 失败时服务端会 WS 推送 order_error；避免与 toast 重复仅对 500 省略
+      if (resp.status !== 500) {
+        showToast({ type: 'order_error', label, exchange, message: err });
+      }
+    }
+  } catch (e) {
+    _orderingKeys.delete(key);
+    _orderResultFlash.set(key, { ok: false, t: Date.now() });
+    showToast({ type: 'order_error', label, exchange, message: '请求异常: ' + e });
   }
   if (_cachedOppRows !== null) renderOppTable();
 }
@@ -1455,6 +1599,10 @@ function _updateMetaBar() {
 function renderOppTable(rows) {
   if (rows !== undefined) _cachedOppRows = rows;
   if (_cachedOppRows === null) return;
+  const _nowFlash = Date.now();
+  for (const [k, v] of [..._orderResultFlash.entries()]) {
+    if (_nowFlash - v.t > 8000) _orderResultFlash.delete(k);
+  }
   _syncExchangeFilter(_cachedOppRows);
   const source = _cachedOppRows.filter(r => _selectedExchanges.size === 0 || _selectedExchanges.has(r.exchange));
   const sorted = _sortOppRows(source);
@@ -1493,8 +1641,17 @@ function renderOppTable(rows) {
     const rowCls = (hasSig ? 'has-signal' : '') + (r.active ? '' : ' inactive');
     const dirCls = r.direction === '正向' ? 'c-fwd' : 'c-rev';
     const netCls = r.net >= 0 ? 'c-pos' : 'c-neg';
-    const stCls  = r.active ? 'c-act' : 'c-ina';
-    const stTxt  = r.active ? '✅ active' : '⏸️ inactive';
+    const okey = r.exchange + '\0' + r.label + '\0' + r.direction;
+    let stCls = r.active ? 'c-act' : 'c-ina';
+    let stTxt = r.active ? '✅ active' : '⏸️ inactive';
+    if (_orderingKeys.has(okey)) {
+      stCls = 'c-ordering';
+      stTxt = '🕐 下单中…';
+    } else if (_orderResultFlash.has(okey)) {
+      const fr = _orderResultFlash.get(okey);
+      stCls = fr.ok ? 'c-pos' : 'c-neg';
+      stTxt = fr.ok ? '✅ 下单成功' : '❌ 下单失败';
+    }
     const expMax = r.expected_max != null ? fmtNum(r.expected_max, 2) : '—';
     const expMaxCls = r.expected_max != null && r.expected_max >= 0 ? 'c-pos' : 'c-neg';
     const symForPx = (r.label || '').split('-')[0];
@@ -1871,7 +2028,7 @@ function loadHistory() {
   const ov = document.getElementById('history-overview-inner');
   if (ov) ov.innerHTML = '<span class="muted" style="font-style:italic">加载中…</span>';
   tb.innerHTML = '<tr><td colspan="15" style="text-align:center;color:var(--text-muted);padding:16px;font-family:sans-serif">加载中…</td></tr>';
-  fetch('/api/opportunity-history?limit=500')
+  fetch(pcpApiUrl('/api/opportunity-history?limit=500'))
     .then(r => r.json())
     .then(data => {
       const sessions = data.sessions || [];
@@ -1977,12 +2134,40 @@ setInterval(() => {
 
 // ── Positions panel ───────────────────────────────────────────────────────────
 
+async function closePositionLeg(positionId, orderId, btn) {
+  if (!confirm(`确认平掉该成交腿？\n持仓 #${positionId} 订单 #${orderId}\n仅平此腿，其余腿不变。`)) return;
+  btn.disabled = true;
+  const old = btn.textContent;
+  btn.textContent = '提交中…';
+  try {
+    const resp = await fetch(pcpApiUrl('/api/close-position-leg'), {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({position_id: positionId, order_id: orderId}),
+    });
+    const data = await resp.json();
+    if (data.ok) {
+      btn.textContent = '已成交';
+      btn.style.borderColor = 'var(--green)';
+      btn.style.color = 'var(--green)';
+    } else {
+      btn.disabled = false;
+      btn.textContent = old;
+      alert('单腿平仓失败：' + (data.message || data.error || '未知错误'));
+    }
+  } catch (e) {
+    btn.disabled = false;
+    btn.textContent = old;
+    alert('请求失败：' + e.message);
+  }
+}
+
 async function closePosition(posId, btn) {
   if (!confirm(`确认平仓？持仓 #${posId} 的三腿将同时提交市价平仓，此操作不可撤销。`)) return;
   btn.disabled = true;
   btn.textContent = '平仓中…';
   try {
-    const resp = await fetch('/api/close-position', {
+    const resp = await fetch(pcpApiUrl('/api/close-position'), {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
       body: JSON.stringify({position_id: posId}),
@@ -2005,11 +2190,11 @@ async function closePosition(posId, btn) {
 }
 
 async function retryExit(posId, btn) {
-  if (!confirm(`确认重试平仓？持仓 #${posId} 中失败的腿将重新下单。`)) return;
+  if (!confirm(`确认全部平仓？持仓 #${posId} 中已成交腿将按 maker→taker 流程发起反向平仓。`)) return;
   btn.disabled = true;
-  btn.textContent = '重试中…';
+  btn.textContent = '平仓中…';
   try {
-    const resp = await fetch('/api/retry-exit', {
+    const resp = await fetch(pcpApiUrl('/api/retry-exit'), {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
       body: JSON.stringify({position_id: posId}),
@@ -2021,48 +2206,55 @@ async function retryExit(posId, btn) {
       btn.style.color = 'var(--green)';
     } else {
       btn.disabled = false;
-      btn.textContent = '重试平仓';
-      alert('重试失败：' + (data.error || data.message || '未知错误'));
+      btn.textContent = '全部平仓';
+      alert('全部平仓失败：' + (data.error || data.message || '未知错误'));
     }
   } catch (e) {
     btn.disabled = false;
-    btn.textContent = '重试平仓';
+    btn.textContent = '全部平仓';
     alert('请求失败：' + e.message);
   }
 }
 
-function showPositionError(posId, ev) {
-  if (ev) ev.stopPropagation();
-  const text = _positionLastError[posId] || '';
-  const body = document.getElementById('pos-err-body');
-  const overlay = document.getElementById('pos-err-overlay');
-  if (!body || !overlay) return;
-  body.textContent = text || '（无错误详情）';
-  document.getElementById('pos-err-sub').textContent = '仓位 ID ' + posId;
-  overlay.classList.add('open');
-}
-
-function closePositionError() {
-  document.getElementById('pos-err-overlay')?.classList.remove('open');
+async function cancelCloseOrder(positionId, orderId, btn) {
+  if (!confirm(`确认取消平仓委托？持仓 #${positionId}，订单 #${orderId}`)) return;
+  btn.disabled = true;
+  btn.textContent = '取消中…';
+  try {
+    const resp = await fetch(pcpApiUrl('/api/cancel-close-order'), {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({ position_id: positionId, order_id: orderId }),
+    });
+    const data = await resp.json();
+    if (data.ok) {
+      btn.textContent = '已取消';
+      btn.style.borderColor = 'var(--green)';
+      btn.style.color = 'var(--green)';
+    } else {
+      btn.disabled = false;
+      btn.textContent = '取消';
+      alert('取消失败：' + (data.error || data.message || '未知错误'));
+    }
+  } catch (e) {
+    btn.disabled = false;
+    btn.textContent = '取消';
+    alert('请求失败：' + e.message);
+  }
 }
 
 function renderPositions() {
   const tb = document.getElementById('positions-tbody');
   if (!tb) return;
   const positions = _lastPositions || [];
-  _positionLastError = {};
   if (positions.length === 0) {
     tb.innerHTML = '<tr><td colspan="12" style="text-align:center;color:var(--text-muted);padding:24px;font-family:sans-serif">无持仓数据</td></tr>';
     return;
   }
   let html = '';
   for (const p of positions) {
-    const errRaw = p.last_error != null && String(p.last_error).trim() !== '' ? String(p.last_error) : '';
-    if (errRaw) _positionLastError[p.id] = errRaw;
-    const errBtn = errRaw
-      ? `<button type="button" class="pos-err-icon" title="查看错误详情" aria-label="错误详情" onclick="showPositionError(${p.id},event)">⚠</button>`
-      : '';
     const hasOrders = p.orders && p.orders.length > 0;
+    const hasFilledOrder = hasOrders && p.orders.some(o => o && o.status === 'filled');
     const toggleBtn = hasOrders
       ? `<button class="pos-toggle-btn" title="展开订单" onclick="togglePosOrders(this,${p.id})">▶</button>`
       : '<span style="color:var(--text-muted);font-size:11px;padding:0 4px">—</span>';
@@ -2072,11 +2264,12 @@ function renderPositions() {
     const epStr = Number.isFinite(epNum) ? fmtNum(epNum, 2) : '—';
     let epCls = 'r';
     if (Number.isFinite(epNum)) epCls += epNum >= 0 ? ' c-pos' : ' c-neg';
-    const closeBtn = p.status === 'open'
-      ? `<button type="button" class="pos-close-btn" title="一键平仓（同时平掉三腿）" onclick="closePosition(${p.id},this)">平仓</button>`
+    const retryBtn = hasFilledOrder
+      ? `<button type="button" class="pos-retry-btn" title="对已成交腿发起全部平仓" onclick="retryExit(${p.id},this)">全部平仓</button>`
       : '';
-    const retryBtn = p.status === 'partial_failed'
-      ? `<button type="button" class="pos-retry-btn" title="重试失败腿平仓" onclick="retryExit(${p.id},this)">重试平仓</button>`
+    const perr = positionErrorSummary(p);
+    const errBtn = perr
+      ? `<button type="button" class="pos-err-icon" title="查看错误详情" aria-label="错误详情" onclick="openPositionError(${p.id})">⚠</button>`
       : '';
     html += `<tr data-pos-id="${p.id}">
       <td class="c" style="width:24px">${toggleBtn}</td>
@@ -2089,12 +2282,12 @@ function renderPositions() {
       <td class="r">${expAnnCell}</td>
       <td class="${epCls}">${epStr}</td>
       <td>${fmtUtcIsoToLocal(p.opened_at)}</td>
-      <td class="c"><span class="pos-status-txt">${escHtml(p.status)}</span>${errBtn}</td>
-      <td class="c">${closeBtn}${retryBtn}</td>
+      <td class="c"><span class="pos-status-txt">${escHtml(fmtPositionStatus(p.status))}</span>${errBtn}</td>
+      <td class="c">${retryBtn}</td>
     </tr>`;
     if (hasOrders) {
       html += `<tr class="pos-orders-row" id="pos-orders-${p.id}"><td colspan="12">` +
-        `<div class="orders-subtable-wrap">${buildOrdersSubtable(p.orders, p.leg_live || {}, p.leg_entry || {}, p.index_price_usdt, p.ct_val, p.symbol)}</div>` +
+        `<div class="orders-subtable-wrap">${buildOrdersSubtable(p.id, p.orders, p.leg_live || {}, p.leg_entry || {}, p.index_price_usdt, p.ct_val, p.symbol, p.status)}</div>` +
         `</td></tr>`;
     }
   }
@@ -2110,6 +2303,14 @@ function renderPositions() {
       }
     }
   }
+  // 清理已不在当前列表中的展开状态记录，防止仓位关闭后 ID 重用时误展开
+  const currentIds = new Set(positions.map(p => p.id));
+  for (const key of Object.keys(localStorage)) {
+    if (key.startsWith('pos-expanded-')) {
+      const id = parseInt(key.slice('pos-expanded-'.length), 10);
+      if (!currentIds.has(id)) localStorage.removeItem(key);
+    }
+  }
 }
 
 // 与 config.DEFAULT_LOT_SIZES 一致：张数 × 乘数 = 标的币数量（服务端 ct_val 缺失时的回退）
@@ -2122,20 +2323,37 @@ function resolvePositionCoinMult(symbol, ctValFromServer) {
   return DEFAULT_CONTRACT_COIN_MULT[s] || 1;
 }
 
-function fmtOrderTypeLabel(ot) {
-  const t = String(ot == null || ot === '' ? 'limit' : ot).toLowerCase();
-  if (t === 'market') return '市价';
-  if (t === 'limit') return '限价';
-  return escHtml(String(ot));
+/** 实际成交流动性：fee_type（maker / taker），与交易所手续费口径一致 */
+function fmtLiquidityCell(o) {
+  if (o.status !== 'filled') {
+    return '<span class="c-dim">—</span>';
+  }
+  const ft = o.fee_type != null ? String(o.fee_type).trim().toLowerCase() : '';
+  if (ft === 'taker') {
+    return '<span class="o-liq-taker" title="吃单 / 主动成交">Taker</span>';
+  }
+  if (ft === 'maker') {
+    return '<span class="o-liq-maker" title="挂单 / 被动成交">Maker</span>';
+  }
+  return '<span class="c-dim">—</span>';
 }
 
-function buildOrdersSubtable(orders, legLive, legEntry, indexPriceUsdt, ctVal, symbol) {
+/** 是否展示买1/卖1（及标记价）：与后端 db._ENTRY_ORDER_STATUSES_FOR_LEG_QUOTES / get_entry_leg_quotes_map 一致，按订单状态而非仓位状态 */
+function orderEntryShowsLegQuotes(o) {
+  if (o.action !== 'open' || !o.leg) return false;
+  return ['filled', 'failed', 'partial_failed', 'pending'].includes(o.status);
+}
+
+function buildOrdersSubtable(positionId, orders, legLive, legEntry, indexPriceUsdt, ctVal, symbol, positionStatus) {
   legLive      = legLive      || {};
   legEntry     = legEntry     || {};
   const coinMult = resolvePositionCoinMult(symbol, ctVal);
   indexPriceUsdt = indexPriceUsdt || 0;
   const symU = String(symbol || '').toUpperCase();
   const legLabel = {call:'Call', put:'Put', future:'Future'};
+  const pendingCloseLegs = new Set((orders || [])
+    .filter(x => x && x.action === 'close' && x.status === 'pending' && x.leg)
+    .map(x => String(x.leg)));
   let rows = '';
   let sumDeltaUsdt = 0;
   let sumFeeUsdt = 0;
@@ -2150,20 +2368,28 @@ function buildOrdersSubtable(orders, legLive, legEntry, indexPriceUsdt, ctVal, s
     let stCls = 'o-pending';
     if (o.status === 'filled') stCls = 'o-filled';
     else if (['failed','canceled','partial_failed'].includes(o.status)) stCls = 'o-failed';
+    const hasOrderErr = o.last_error != null && String(o.last_error).trim() !== '';
+    let statusCellInner = escHtml(o.status || '');
+    if (hasOrderErr) {
+      const isSuccess = o.status === 'filled';
+      const iconCls = isSuccess ? 'info' : 'err';
+      const iconChar = isSuccess ? '💡' : '⚠';
+      statusCellInner += ` <button type="button" class="order-err-icon ${iconCls}" title="查看详情" aria-label="状态详情" onclick="openOrderError(${positionId},${o.id})">${iconChar}</button>`;
+    }
     const limitPx  = o.limit_px  != null ? fmtNum(o.limit_px,  4) : '—';
     const filledPx = o.filled_px != null ? fmtNum(o.filled_px, 4) : '—';
     // 手续费显示：优先原始币种，否则用 index_price_usdt 实时计算 USDT
-    let feeStr = '—';
+    let feeStr = '<span class="c-dim">—</span>';
     if (o.actual_fee != null && o.fee_ccy) {
       const rawFee = o.actual_fee;
       const ccy    = o.fee_ccy.toUpperCase();
       if (ccy === 'USDT') {
-        feeStr = fmtNum(rawFee, 6) + ' USDT';
+        feeStr = '<div class="o-stack-r"><div>' + fmtNum(rawFee, 6) + '</div><div class="o-sub">USDT</div></div>';
       } else if (indexPriceUsdt > 0) {
         const feeUsdt = rawFee * indexPriceUsdt;
-        feeStr = fmtNum(rawFee, 6) + ' ' + escHtml(ccy) + ' (' + fmtNum(feeUsdt, 4) + ' U)';
+        feeStr = '<div class="o-stack-r"><div>' + fmtNum(rawFee, 6) + ' ' + escHtml(ccy) + '</div><div class="o-sub">≈ ' + fmtNum(feeUsdt, 4) + ' U</div></div>';
       } else {
-        feeStr = fmtNum(rawFee, 6) + ' ' + escHtml(ccy);
+        feeStr = '<div class="o-stack-r"><div>' + fmtNum(rawFee, 6) + '</div><div class="o-sub">' + escHtml(ccy) + '</div></div>';
       }
     }
     if (o.status === 'filled') {
@@ -2185,25 +2411,37 @@ function buildOrdersSubtable(orders, legLive, legEntry, indexPriceUsdt, ctVal, s
       }
     }
     const instId = o.inst_id ? escHtml(o.inst_id) : '—';
-    const exOid  = o.exchange_order_id ? escHtml(o.exchange_order_id) : '—';
+    const idLine = o.id != null && o.id !== '' ? escHtml(String(o.id)) : '—';
+    const exLine = o.exchange_order_id ? escHtml(String(o.exchange_order_id)) : '—';
+    const idsCell =
+      '<div class="o-order-ids" style="display:flex;flex-direction:column;align-items:flex-start;gap:3px;line-height:1.25;text-align:left">' +
+      '<div><span style="color:var(--text-muted);font-size:10px">*</span> ' +
+      `<span style="font-family:monospace;font-size:11px;color:var(--text)">${idLine}</span></div>` +
+      '<div><span style="color:var(--text-muted);font-size:10px">*</span> ' +
+      `<span style="font-family:monospace;font-size:10px;color:var(--text);word-break:break-all">${exLine}</span></div>` +
+      '</div>';
     // Live bid/ask, depth, mark price and delta
     let bidAskStr = '—';
     let depthStr  = '—';
     let markPxStr = '—';
-    let deltaStr  = '—';
-    if (o.action === 'open' && o.leg) {
+    let deltaStr  = '<span class="c-dim">—</span>';
+    if (orderEntryShowsLegQuotes(o)) {
       const live = legLive[o.leg];
       if (live) {
         const b  = live.bid1   != null ? fmtNum(live.bid1,   4) : '—';
         const a  = live.ask1   != null ? fmtNum(live.ask1,   4) : '—';
         const bs = live.bid_sz != null ? `(${fmtNum(live.bid_sz, 0)})` : '';
         const as_ = live.ask_sz != null ? `(${fmtNum(live.ask_sz, 0)})` : '';
-        // ⚔ 标在对手价一侧：buy 的对手价是 ask1，sell 的对手价是 bid1
-        if (o.side === 'buy') {
-          bidAskStr = `${b}${bs ? ' ' + bs : ''} / 🎯 ${a}${as_ ? ' ' + as_ : ''}`;
-        } else {
-          bidAskStr = `🎯 ${b}${bs ? ' ' + bs : ''} / ${a}${as_ ? ' ' + as_ : ''}`;
-        }
+        // 买一 / 卖一 上下排布；🎯 标在对手价一侧：buy → 卖一，sell → 买一
+        const bidPart = `${b}${bs ? ' ' + bs : ''}`;
+        const askPart = `${a}${as_ ? ' ' + as_ : ''}`;
+        const markBid = o.side === 'sell' ? ' 🎯' : '';
+        const markAsk = o.side === 'buy' ? ' 🎯' : '';
+        bidAskStr =
+          '<div class="o-bid-ask-stack" style="display:flex;flex-direction:column;align-items:flex-start;gap:2px;line-height:1.3;text-align:left">' +
+          `<div><span style="color:var(--text-muted);font-size:10px">买一</span> <span style="font-family:monospace;font-size:11px">${bidPart}</span>${markBid}</div>` +
+          `<div><span style="color:var(--text-muted);font-size:10px">卖一</span> <span style="font-family:monospace;font-size:11px">${askPart}</span>${markAsk}</div>` +
+          '</div>';
         if (live.mark_price != null) {
           markPxStr = fmtNum(live.mark_price, 4);
         }
@@ -2218,6 +2456,9 @@ function buildOrdersSubtable(orders, legLive, legEntry, indexPriceUsdt, ctVal, s
             const pctVal    = o.filled_px > 0 ? priceDiff / o.filled_px * 100 : null;
             const pctStr    = pctVal != null && isFinite(pctVal)
               ? ` ${pctVal >= 0 ? '+' : ''}${fmtNum(pctVal, 2)}%` : '';
+            const pctDisplay = pctVal != null && isFinite(pctVal)
+              ? `${pctVal >= 0 ? '+' : ''}${fmtNum(pctVal, 2)}%`
+              : '';
             if (o.leg === 'call' || o.leg === 'put') {
               const coinDelta = rawDelta;
               const usdtDelta = rawDelta * indexPriceUsdt;
@@ -2229,7 +2470,15 @@ function buildOrdersSubtable(orders, legLive, legEntry, indexPriceUsdt, ctVal, s
                 const cSign   = coinDelta  >= 0 ? '+' : '';
                 const uSign   = usdtDelta  >= 0 ? '+' : '';
                 const coinSym = (o.fee_ccy || (o.inst_id || '').split('-')[0] || 'coin').toUpperCase();
-                deltaStr = `<span style="color:${dColor}">${cSign}${fmtNum(coinDelta, 4)} ${escHtml(coinSym)} (${uSign}${fmtNum(usdtDelta, 2)} U${pctStr})</span>`;
+                const valLine = `<span style="color:${dColor}">${cSign}${fmtNum(coinDelta, 4)} ${escHtml(coinSym)} (${uSign}${fmtNum(usdtDelta, 2)} U)</span>`;
+                if (pctDisplay) {
+                  deltaStr = '<div class="o-stack-r">' +
+                    `<div><span style="color:${dColor};font-size:11px">${pctDisplay}</span></div>` +
+                    `<div>${valLine}</div>` +
+                    '</div>';
+                } else {
+                  deltaStr = '<div class="o-stack-r"><div>' + valLine + '</div></div>';
+                }
               }
             } else {
               if (isFinite(rawDelta)) {
@@ -2238,7 +2487,15 @@ function buildOrdersSubtable(orders, legLive, legEntry, indexPriceUsdt, ctVal, s
                 anyDeltaUsdt = true;
                 const dColor = rawDelta >= 0 ? 'var(--green)' : 'var(--red)';
                 const dSign  = rawDelta >= 0 ? '+' : '';
-                deltaStr = `<span style="color:${dColor}">${dSign}${fmtNum(rawDelta, 2)} U${pctStr}</span>`;
+                const uLine = `<span style="color:${dColor}">${dSign}${fmtNum(rawDelta, 2)} U</span>`;
+                if (pctStr && String(pctStr).trim() !== '') {
+                  deltaStr = '<div class="o-stack-r">' +
+                    `<div><span style="color:${dColor};font-size:11px">${pctStr.trim()}</span></div>` +
+                    `<div>${uLine}</div>` +
+                    '</div>';
+                } else {
+                  deltaStr = '<div class="o-stack-r"><div>' + uLine + '</div></div>';
+                }
               }
             }
           }
@@ -2250,14 +2507,10 @@ function buildOrdersSubtable(orders, legLive, legEntry, indexPriceUsdt, ctVal, s
     {
       const q = o.filled_qty != null ? o.filled_qty : o.qty;
       if (q != null) {
-        const isSell = o.side === 'sell';
-        const qtySigned = isSell ? -q : q;
-        const coinSigned = qtySigned * coinMult;
         const coinSym = ((o.inst_id || '').split('-')[0] || 'BTC').toUpperCase();
-        const color = isSell ? 'var(--red)' : '';
-        const style = color ? ` style="color:${color}"` : '';
-        qtyContractsCell = `<span${style}>${fmtNum(qtySigned, 0)}</span>`;
-        qtyCoinCell = `<span${style}>${fmtNum(coinSigned, 2)} ${escHtml(coinSym)}</span>`;
+        const coinAmt = q * coinMult;
+        qtyContractsCell = fmtNum(q, 0);
+        qtyCoinCell = `${fmtNum(coinAmt, 2)} ${escHtml(coinSym)}`;
       }
     }
     let netCell = '<span class="c-dim">—</span>';
@@ -2266,30 +2519,43 @@ function buildOrdersSubtable(orders, legLive, legEntry, indexPriceUsdt, ctVal, s
       const nColor = netU >= 0 ? 'var(--green)' : 'var(--red)';
       netCell = `<span style="color:${nColor}">${fmtNum(netU, 2)} U</span>`;
     }
+    let actionCell = '—';
+    const ps = String(positionStatus || '');
+    const canLegClose = ps === 'open' || ps === 'partial_failed';
+    if (o.action === 'close' && o.status === 'pending' && o.id != null) {
+      actionCell = `<button type="button" class="pos-leg-close-btn" title="取消该平仓委托" onclick="cancelCloseOrder(${positionId},${o.id},this)">取消</button>`;
+    } else if (canLegClose && o.status === 'filled' && o.action === 'open' && o.id != null) {
+      if (pendingCloseLegs.has(String(o.leg || ''))) {
+        actionCell = '<span class="c-dim">平仓中</span>';
+      } else {
+      actionCell = `<button type="button" class="pos-leg-close-btn" title="仅平该成交腿" onclick="closePositionLeg(${positionId},${o.id},this)">平该腿</button>`;
+      }
+    }
     rows += `<tr>
       <td class="c o-leg">${leg}</td>
       <td style="font-size:10px;color:var(--text-muted)">${instId}</td>
-      <td class="c">${fmtOrderTypeLabel(o.order_type)}</td>
       <td class="c ${actCls}">${actTxt}</td>
       <td class="c">${escHtml(o.side || '')}</td>
       <td class="r">${qtyContractsCell}</td>
       <td class="r">${qtyCoinCell}</td>
       <td class="r">${limitPx}</td>
       <td class="r">${filledPx}</td>
-      <td class="r" style="font-size:11px;color:var(--text-muted)">${bidAskStr}</td>
-      <td class="r">${deltaStr}</td>
-      <td class="r">${feeStr}</td>
+      <td class="c">${fmtLiquidityCell(o)}</td>
+      <td style="font-size:11px;color:var(--text-muted);vertical-align:top;text-align:left;padding:6px 8px">${bidAskStr}</td>
+      <td class="r o-cell-split">${deltaStr}</td>
+      <td class="r o-cell-split">${feeStr}</td>
       <td class="r">${netCell}</td>
-      <td class="c ${stCls}">${escHtml(o.status || '')}</td>
-      <td style="font-size:10px;color:var(--text-muted)">${exOid}</td>
+      <td class="c ${stCls}">${statusCellInner}</td>
+      <td style="vertical-align:top;padding:6px 8px;text-align:left">${idsCell}</td>
+      <td class="c">${actionCell}</td>
     </tr>`;
   }
   const deltaTotStr = anyDeltaUsdt
-    ? `<span class="ost-val" style="color:${sumDeltaUsdt >= 0 ? 'var(--green)' : 'var(--red)'}">${fmtNum(sumDeltaUsdt, 2)} U</span>`
+    ? '<div class="o-stack-r"><div><span class="ost-val" style="color:' + (sumDeltaUsdt >= 0 ? 'var(--green)' : 'var(--red)') + '">' + fmtNum(sumDeltaUsdt, 2) + '</span></div><div class="o-sub">U</div></div>'
     : '<span class="ost-val c-dim">—</span>';
   const feeTotStr = feeSumIncomplete
     ? '<span class="ost-val c-dim">—</span>'
-    : `<span class="ost-val orders-subtable-sum-fee">-${fmtNum(sumFeeUsdt, 2)} U</span>`;
+    : '<div class="o-stack-r"><div><span class="ost-val orders-subtable-sum-fee">-' + fmtNum(sumFeeUsdt, 2) + '</span></div><div class="o-sub">USDT</div></div>';
   let netTotStr = '<span class="ost-val c-dim">—</span>';
   if (!feeSumIncomplete) {
     const sumNet = sumDeltaUsdt - sumFeeUsdt;
@@ -2298,17 +2564,19 @@ function buildOrdersSubtable(orders, legLive, legEntry, indexPriceUsdt, ctVal, s
   const footRow =
     '<tr class="orders-subtable-sum-row">' +
     '<td colspan="10" class="r orders-subtable-sum-label">合计</td>' +
-    '<td class="r">' + deltaTotStr + '</td>' +
-    '<td class="r">' + feeTotStr + '</td>' +
+    '<td class="r o-cell-split">' + deltaTotStr + '</td>' +
+    '<td class="r o-cell-split">' + feeTotStr + '</td>' +
     '<td class="r">' + netTotStr + '</td>' +
-    '<td colspan="2"></td>' +
+    '<td colspan="3"></td>' +
     '</tr>';
   return `<table class="orders-subtable">
     <thead><tr>
-      <th class="c">腿</th><th>合约</th><th class="c">类型</th><th class="c">动作</th><th class="c">方向</th>
+      <th class="c">腿</th><th>合约</th><th class="c">动作</th><th class="c">方向</th>
       <th class="r">持仓张数</th><th class="r">持仓币数</th><th class="r">限价</th><th class="r">成交均价</th>
-      <th class="r">买1/卖1价 (深度)</th><th class="r">价差</th>
-      <th class="r">手续费</th><th class="r">净利</th><th class="c">状态</th><th>交易所订单号</th>
+      <th class="c" title="按成交手续费推断：Maker=挂单被动成交，Taker=吃单主动成交">流动性方向</th>
+      <th style="text-align:left;min-width:7.5rem">买一价 / 卖一价 (深度)</th><th class="r">价差</th>
+      <th class="r">手续费</th><th class="r">净利</th><th class="c">状态</th>
+      <th style="min-width:9rem;text-align:left">本地 / 交易所订单 ID</th><th class="c">操作</th>
     </tr></thead>
     <tbody>${rows}</tbody>
     <tfoot>${footRow}</tfoot>
@@ -2337,7 +2605,7 @@ function togglePosOrders(btn, posId) {
         for (const orderRow of orderRows) {
           const statusCell = orderRow.querySelector('.o-filled, .o-pending, .o-failed');
           if (statusCell && statusCell.textContent === 'filled') {
-            const filledPxCell = orderRow.querySelector('td:nth-child(9)');
+            const filledPxCell = orderRow.querySelector('td:nth-child(8)');
             if (filledPxCell && filledPxCell.textContent.trim() === '—') {
               // 成交均价为空，触发后台回填（通过 WebSocket 或 polling）
               // 这里只是标记，实际回填由后端的 _build_payload 自动触发
@@ -2387,7 +2655,7 @@ function renderAccounts() {
 let activeExTab = '';
 
 function loadOverview() {
-  fetch('/api/triplet-summary')
+  fetch(pcpApiUrl('/api/triplet-summary'))
     .then(r => r.json())
     .then(data => renderOverview(data))
     .catch(err => {
@@ -2566,12 +2834,26 @@ function updateLegPricesLive(legPrices) {
     }
     changed = true;
   }
-  if (changed) renderPositions();
+  if (changed) _updateExpandedSubtablesLive();
+}
+
+function _updateExpandedSubtablesLive() {
+  const expandedRows = document.querySelectorAll('.pos-orders-row.expanded');
+  if (!expandedRows.length) return;
+  const positions = _lastPositions || [];
+  for (const row of expandedRows) {
+    const posId = parseInt(row.id.replace('pos-orders-', ''), 10);
+    const pos = positions.find(p => p.id === posId);
+    if (!pos || !pos.orders) continue;
+    const wrap = row.querySelector('.orders-subtable-wrap');
+    if (!wrap) continue;
+    wrap.innerHTML = buildOrdersSubtable(pos.id, pos.orders, pos.leg_live || {}, pos.leg_entry || {}, pos.index_price_usdt, pos.ct_val, pos.symbol, pos.status);
+  }
 }
 
 function connectData() {
   const wsProto = (location.protocol === 'https:') ? 'wss:' : 'ws:';
-  const ws = new WebSocket(wsProto + '//' + location.host + '/ws-data');
+  const ws = new WebSocket(wsProto + '//' + location.host + pcpApiUrl('/ws-data'));
   ws.onopen = () => {
     console.log('[ws] connected');
     setWsStatus(true);
@@ -2704,7 +2986,7 @@ document.addEventListener('keydown', e => {
 <div id="pos-err-overlay" onclick="if(event.target===this)closePositionError()">
   <div id="pos-err-modal" onclick="event.stopPropagation()">
     <button type="button" id="pos-err-close" onclick="closePositionError()">✕</button>
-    <h3>仓位错误详情</h3>
+    <h3 id="pos-err-title">仓位错误详情</h3>
     <div id="pos-err-sub" style="font-size:11px;color:var(--text-muted);margin-top:-4px;font-family:sans-serif"></div>
     <pre id="pos-err-body"></pre>
   </div>

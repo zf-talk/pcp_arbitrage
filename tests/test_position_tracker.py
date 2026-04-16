@@ -249,6 +249,35 @@ def test_update_positions_cache_also_updates_web_dashboard():
     position_tracker.update_positions_cache([])
 
 
+def test_log_symbol_price_changes_every_3_minutes():
+    position_tracker._symbol_last_mark_cache.clear()
+    position_tracker._symbol_price_log_last_ts = 0.0
+    try:
+        with patch("pcp_arbitrage.position_tracker.time.time", return_value=1000.0), \
+             patch.object(position_tracker.logger, "info") as mock_info:
+            position_tracker._log_symbol_price_changes_if_due({"BTC": 100.0, "ETH": 200.0})
+            mock_info.assert_called_once()
+            msg = mock_info.call_args[0][1]
+            assert "BTC: 100.0000 (baseline)" in msg
+            assert "ETH: 200.0000 (baseline)" in msg
+
+        with patch("pcp_arbitrage.position_tracker.time.time", return_value=1100.0), \
+             patch.object(position_tracker.logger, "info") as mock_info:
+            position_tracker._log_symbol_price_changes_if_due({"BTC": 101.0, "ETH": 198.0})
+            mock_info.assert_not_called()
+
+        with patch("pcp_arbitrage.position_tracker.time.time", return_value=1181.0), \
+             patch.object(position_tracker.logger, "info") as mock_info:
+            position_tracker._log_symbol_price_changes_if_due({"BTC": 102.0, "ETH": 197.0})
+            mock_info.assert_called_once()
+            msg = mock_info.call_args[0][1]
+            assert "BTC: 102.0000 (+1.0000, +0.99%)" in msg
+            assert "ETH: 197.0000 (-1.0000, -0.51%)" in msg
+    finally:
+        position_tracker._symbol_last_mark_cache.clear()
+        position_tracker._symbol_price_log_last_ts = 0.0
+
+
 # ---------------------------------------------------------------------------
 # Test: no positions → no OKX call, empty cache
 # ---------------------------------------------------------------------------
@@ -444,17 +473,51 @@ from pcp_arbitrage import order_manager as _om
 async def test_exit_monitor_picks_up_partial_failed(tmp_path, monkeypatch):
     """守护协程应接管 partial_failed 仓位并调用 submit_exit"""
     db_path = str(tmp_path / "test.db")
-    con = sqlite3.connect(db_path)
-    con.execute("""
-        CREATE TABLE positions (
-            id INTEGER PRIMARY KEY, status TEXT, exchange TEXT,
-            exit_attempt_count INTEGER DEFAULT 0,
-            exit_started_at TEXT, exit_last_attempt_at TEXT
-        )
-    """)
-    con.execute("INSERT INTO positions (id, status, exchange) VALUES (1, 'partial_failed', 'okx')")
-    con.commit()
-    con.close()
+    from pcp_arbitrage import db as _dbm
+
+    _dbm.init_db(db_path)
+    conn = sqlite3.connect(db_path)
+    try:
+        with conn:
+            pid = _dbm.create_position(
+                conn,
+                signal_id=None,
+                exchange="OKX",
+                symbol="BTC",
+                expiry="260417",
+                strike=74500.0,
+                direction="reverse",
+                call_inst_id="BTC-USD-260417-74500-C",
+                put_inst_id="BTC-USD-260417-74500-P",
+                future_inst_id="BTC-USD-260417",
+            )
+            conn.execute(
+                "UPDATE positions SET status='partial_failed' WHERE id=?",
+                (pid,),
+            )
+            for leg, inst, side in (
+                ("call", "BTC-USD-260417-74500-C", "sell"),
+                ("put", "BTC-USD-260417-74500-P", "buy"),
+                ("future", "BTC-USD-260417", "buy"),
+            ):
+                oid = _dbm.create_order(
+                    conn,
+                    signal_id=None,
+                    position_id=pid,
+                    inst_id=inst,
+                    leg=leg,
+                    action="open",
+                    side=side,
+                    limit_px=0.01,
+                    qty=0.01,
+                )
+                conn.execute(
+                    "UPDATE orders SET status='filled', filled_px=0.01, "
+                    "exchange_order_id=?, filled_at=? WHERE id=?",
+                    ("ex-" + leg, "2026-01-01T00:00:00.000Z", oid),
+                )
+    finally:
+        conn.close()
 
     submitted = []
     async def fake_submit_exit(pos, cfg, path):
@@ -463,8 +526,10 @@ async def test_exit_monitor_picks_up_partial_failed(tmp_path, monkeypatch):
     cfg = _mock.MagicMock()
     cfg.sqlite_path = db_path
     cfg.exit_monitor_interval_secs = 0.05  # 50ms
+    cfg.exchanges = {"OKX": _mock.MagicMock()}
 
     monkeypatch.setattr(_om, "submit_exit", fake_submit_exit)
+    monkeypatch.setattr(_om, "okx_exit_allowed_by_exchange", _mock.AsyncMock(return_value=True))
 
     task = _asyncio.create_task(position_tracker.exit_monitor_loop(cfg))
     await _asyncio.sleep(0.2)

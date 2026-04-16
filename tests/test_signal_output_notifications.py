@@ -4,7 +4,7 @@ from __future__ import annotations
 import inspect
 from unittest.mock import MagicMock, patch
 
-from pcp_arbitrage.config import AppConfig, TelegramConfig
+from pcp_arbitrage.config import AppConfig, ExchangeConfig, TelegramConfig
 from pcp_arbitrage.exchange_symbols import format_strike_display
 from pcp_arbitrage.models import Triplet
 from pcp_arbitrage.pcp_calculator import ArbitrageSignal
@@ -17,6 +17,7 @@ import pcp_arbitrage.signal_output as signal_output
 
 def _make_triplet(symbol: str = "BTC", expiry: str = "250425", strike: float = 80000.0) -> Triplet:
     return Triplet(
+        exchange="okx",
         symbol=symbol,
         expiry=expiry,
         strike=strike,
@@ -55,9 +56,31 @@ def _make_cfg(
     order_min_annualized_rate: float = 0.05,
     bot_token: str = "123:ABC",
     chat_id: str = "-100999",
+    *,
+    arbitrage_enabled: bool = True,
 ) -> AppConfig:
+    """Includes OKX + Binance so emit_opportunity_evaluation can match exchange keys for auto-trade gate."""
     return AppConfig(
-        exchanges={},
+        exchanges={
+            "OKX": ExchangeConfig(
+                name="OKX",
+                enabled=True,
+                margin_type="coin",
+                api_key="",
+                secret_key="",
+                passphrase="",
+                arbitrage_enabled=arbitrage_enabled,
+            ),
+            "Binance": ExchangeConfig(
+                name="Binance",
+                enabled=True,
+                margin_type="coin",
+                api_key="",
+                secret_key="",
+                passphrase="",
+                arbitrage_enabled=arbitrage_enabled,
+            ),
+        },
         symbols=["BTC"],
         min_annualized_rate=0.01,
         order_min_annualized_rate=order_min_annualized_rate,
@@ -79,6 +102,7 @@ def _configure(cfg: AppConfig) -> None:
     signal_output._mode = "classic"
     signal_output._dash = None
     signal_output._notified_keys = {}
+    signal_output._ann_suppress_state = {}
 
 
 def _make_create_task_mock() -> MagicMock:
@@ -237,10 +261,11 @@ async def test_notification_not_fired_when_cfg_is_none():
 
 
 async def test_notification_keys_are_per_direction():
-    """Different directions for same triplet get independent dedup state."""
+    """同 (exchange,label) 下各方向仍有独立 _notified_keys；年化相差 >1% 时互不触发「近重复」抑制，可各自发通知。"""
     triplet = _make_triplet()
     sig_fwd = _make_signal(triplet, annualized_return=0.10, direction="forward")
-    sig_rev = _make_signal(triplet, annualized_return=0.10, direction="reverse")
+    # 与 forward 相差 > opportunity_ann_suppress_max_delta，避免 (exchange,label) 年化去重挡住 reverse
+    sig_rev = _make_signal(triplet, annualized_return=0.12, direction="reverse")
     cfg = _make_cfg(order_min_annualized_rate=0.05)
     _configure(cfg)
 
@@ -256,6 +281,27 @@ async def test_notification_keys_are_per_direction():
 
     # Each direction fires independently (2 tasks each = 4 total)
     assert mock_create_task.call_count == 4
+
+
+async def test_ann_duplicate_suppresses_second_direction_notify():
+    """(exchange,label) 年化近重复时不含方向：先 forward 再 reverse 且年化近同则第二方向不 create_task。"""
+    triplet = _make_triplet()
+    sig_fwd = _make_signal(triplet, annualized_return=0.10, direction="forward")
+    sig_rev = _make_signal(triplet, annualized_return=0.105, direction="reverse")
+    cfg = _make_cfg(order_min_annualized_rate=0.05)
+    _configure(cfg)
+
+    mock_create_task = _make_create_task_mock()
+    with patch("asyncio.create_task", mock_create_task), \
+         patch.object(signal_output, "_trace_evaluation"):
+        signal_output.emit_opportunity_evaluation(
+            "OKX", triplet, "forward", sig_fwd, min_annualized_rate=0.01
+        )
+        signal_output.emit_opportunity_evaluation(
+            "OKX", triplet, "reverse", sig_rev, min_annualized_rate=0.01
+        )
+
+    assert mock_create_task.call_count == 2
 
 
 async def test_notification_keys_are_per_exchange():
@@ -291,3 +337,119 @@ async def test_configure_signal_output_resets_notified_keys():
         signal_output.configure_signal_output(cfg)
 
     assert signal_output._notified_keys == {}
+    assert signal_output._ann_suppress_state == {}
+
+
+def test_duplicate_ann_within_window_skips_csv_trace():
+    """5 分钟内同合约年化变动 ≤1%：不重复写 opportunity CSV 快照。"""
+    _configure(_make_cfg())
+    triplet = _make_triplet()
+    mock_ct = _make_create_task_mock()
+    with patch("pcp_arbitrage.signal_output.record_opportunity_snap") as m_rec, \
+         patch("asyncio.create_task", mock_ct):
+        signal_output.emit_opportunity_evaluation(
+            "okx", triplet, "forward", _make_signal(triplet, annualized_return=0.10), 0.01
+        )
+        signal_output.emit_opportunity_evaluation(
+            "okx", triplet, "forward", _make_signal(triplet, annualized_return=0.105), 0.01
+        )
+    assert m_rec.call_count == 1
+
+
+def test_duplicate_ann_exceeds_delta_traces_again():
+    """年化变动 >1% 时仍写入追踪。"""
+    _configure(_make_cfg())
+    triplet = _make_triplet()
+    mock_ct = _make_create_task_mock()
+    with patch("pcp_arbitrage.signal_output.record_opportunity_snap") as m_rec, \
+         patch("asyncio.create_task", mock_ct):
+        signal_output.emit_opportunity_evaluation(
+            "okx", triplet, "forward", _make_signal(triplet, annualized_return=0.10), 0.01
+        )
+        signal_output.emit_opportunity_evaluation(
+            "okx", triplet, "forward", _make_signal(triplet, annualized_return=0.12), 0.01
+        )
+    assert m_rec.call_count == 2
+
+
+def test_duplicate_ann_ignores_direction():
+    """正/反向共用 (exchange,label) 基准：先 forward 再 reverse 且年化近同则只记一次 CSV。"""
+    _configure(_make_cfg())
+    triplet = _make_triplet()
+    mock_ct = _make_create_task_mock()
+    with patch("pcp_arbitrage.signal_output.record_opportunity_snap") as m_rec, \
+         patch("asyncio.create_task", mock_ct):
+        signal_output.emit_opportunity_evaluation(
+            "okx", triplet, "forward", _make_signal(triplet, annualized_return=0.10), 0.01
+        )
+        signal_output.emit_opportunity_evaluation(
+            "okx", triplet, "reverse", _make_signal(triplet, annualized_return=0.105, direction="reverse"), 0.01
+        )
+    assert m_rec.call_count == 1
+
+
+def test_log_monitored_opportunities_only_when_changed():
+    class _FakeRow:
+        def __init__(self, active: bool) -> None:
+            self.active = active
+
+    class _FakeDash:
+        def __init__(self) -> None:
+            self._rows = {}
+            self._symbols = []
+            self._index_prices = {}
+
+    fake_dash = _FakeDash()
+    fake_dash._rows = {
+        ("okx", "BTC-250425-80000", "forward"): _FakeRow(True),
+        ("okx", "BTC-250425-80000", "reverse"): _FakeRow(False),
+    }
+    fake_dash._symbols = ["BTC", "ETH"]
+    fake_dash._index_prices = {"BTC": 100000.0, "ETH": 3000.0}
+    signal_output._dash = fake_dash
+    signal_output._last_monitored_opportunity_log_ts = 0.0
+    signal_output._last_monitored_opportunity_total = 0
+    signal_output._last_monitored_symbol_prices = {}
+    try:
+        with patch("pcp_arbitrage.signal_output.time.monotonic", return_value=1000.0), \
+             patch.object(signal_output.logger, "info") as mock_info:
+            signal_output._log_monitored_opportunities_if_due()
+            mock_info.assert_called_once()
+            args = mock_info.call_args[0]
+            assert args[1] == 2
+            assert args[2] == 1
+            assert args[3] == 2
+            assert "BTC=100000.0000 (baseline)" in args[4]
+            assert "ETH=3000.0000 (baseline)" in args[4]
+
+        # Within 5 minutes: no log
+        fake_dash._rows[("okx", "ETH-250425-3000", "forward")] = _FakeRow(True)
+        fake_dash._index_prices["BTC"] = 100500.0
+        fake_dash._index_prices["ETH"] = 2980.0
+        with patch("pcp_arbitrage.signal_output.time.monotonic", return_value=1100.0), \
+             patch.object(signal_output.logger, "info") as mock_info:
+            signal_output._log_monitored_opportunities_if_due()
+            mock_info.assert_not_called()
+
+        # After 5 minutes and count changed: log with +1
+        with patch("pcp_arbitrage.signal_output.time.monotonic", return_value=1301.0), \
+             patch.object(signal_output.logger, "info") as mock_info:
+            signal_output._log_monitored_opportunities_if_due()
+            mock_info.assert_called_once()
+            args = mock_info.call_args[0]
+            assert args[1] == 3
+            assert args[2] == 2
+            assert args[3] == 1
+            assert "BTC=100500.0000 (+500.0000, +0.50%)" in args[4]
+            assert "ETH=2980.0000 (-20.0000, -0.67%)" in args[4]
+
+        # After next interval but count unchanged: should not log
+        with patch("pcp_arbitrage.signal_output.time.monotonic", return_value=1602.0), \
+             patch.object(signal_output.logger, "info") as mock_info:
+            signal_output._log_monitored_opportunities_if_due()
+            mock_info.assert_not_called()
+    finally:
+        signal_output._dash = None
+        signal_output._last_monitored_opportunity_log_ts = 0.0
+        signal_output._last_monitored_opportunity_total = 0
+        signal_output._last_monitored_symbol_prices = {}

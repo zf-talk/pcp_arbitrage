@@ -135,7 +135,7 @@ async def _run(cfg_path: str = "config.yaml", web_dashboard_override: str | None
     if cfg.web_dashboard_enabled:
         _wd.set_app_config(cfg)
         tasks.append(asyncio.create_task(
-            run_web_dashboard_loop(cfg.web_dashboard_host, cfg.web_dashboard_port, cfg.web_dashboard_width)
+            run_web_dashboard_loop(cfg.web_dashboard_host, cfg.web_dashboard_port)
         ))
     if cfg.sqlite_path:
         from pcp_arbitrage import position_tracker

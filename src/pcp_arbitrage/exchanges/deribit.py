@@ -329,10 +329,12 @@ class DeribitRestClient:
         }
         headers = {"Authorization": f"Bearer {self._token}"}
         async with self._session.post(f"/api/v2/{method}", json=payload, headers=headers) as resp:
-            resp.raise_for_status()
+            if not resp.ok:
+                body = await resp.text()
+                raise RuntimeError(f"Deribit {method} HTTP {resp.status}: {body} | params={payload['params']}")
             data = await resp.json()
         if "error" in data:
-            raise RuntimeError(f"Deribit order error: {data['error']}")
+            raise RuntimeError(f"Deribit order error: {data['error']} | params={payload['params']}")
         return str(data["result"]["order"]["order_id"])
 
     async def get_order_state(self, order_id: str) -> dict:

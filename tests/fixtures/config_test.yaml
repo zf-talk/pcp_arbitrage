@@ -1,26 +1,21 @@
 exchanges:
   okx:
     enabled: true
-    margin_type: coin
     api_key: "test_key"
     secret_key: "test_secret"
     passphrase: "test_pass"
-    is_paper_trading: false
   binance:
     enabled: false
-    margin_type: usdt
     api_key: "test_key_b"
     secret_key: "test_secret_b"
 
   deribit:
     enabled: false
-    margin_type: coin
     api_key: "test_key_d"
     secret_key: "test_secret_d"
 
   deribit_linear:
     enabled: false
-    margin_type: usdc
     api_key: "test_key_dl"
     secret_key: "test_secret_dl"
 
@@ -33,8 +28,6 @@ arbitrage:
     - BTC
     - ETH
   stale_threshold_ms: 5000
-  signal_ui: classic
-  signal_dashboard_max_rows: 30
   dashboard_quiet_exchanges: true
 
 telegram:

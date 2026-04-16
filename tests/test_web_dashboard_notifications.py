@@ -102,3 +102,136 @@ def test_update_single_account_balance_merges() -> None:
 
     assert web_dashboard._account_balances_cache["okx"]["total_eq_usdt"] == 1000.0
     assert web_dashboard._account_balances_cache["deribit"]["total_eq_usdt"] == 500.0
+
+
+def test_build_payload_fallback_sessions_when_rows_empty(tmp_path) -> None:
+    """内存 _rows 为空但 SQLite 中有已结束会话时，机会监控仍能显示行（与「历史有机会、监控空白」一致）。"""
+    from pcp_arbitrage.db import close_opportunity_session, init_db, insert_opportunity_session
+    from pcp_arbitrage.opportunity_dashboard import OpportunityDashboard
+
+    path = str(tmp_path / "o.db")
+    init_db(path)
+    sid = insert_opportunity_session(
+        path,
+        exchange="okx",
+        contract="BTC-260417-74500",
+        direction="反向",
+        started_utc="2026-04-15T10:00:00.000Z",
+    )
+    close_opportunity_session(
+        path,
+        sid,
+        ended_utc="2026-04-15T10:05:00.000Z",
+        duration_sec=300.0,
+        gross_usdt=10.0,
+        fee_usdt=1.0,
+        net_usdt=9.0,
+        tradeable=2.0,
+        ann_pct=3.0,
+        ann_pct_max=3.5,
+        days_to_exp=2.0,
+    )
+    dash = OpportunityDashboard(sqlite_path=path)
+    assert not dash._rows
+    payload = web_dashboard._build_payload(dash, full=True)
+    assert len(payload["rows"]) >= 1
+    row = payload["rows"][0]
+    assert row["exchange"] == "okx"
+    assert row["label"] == "BTC-260417-74500"
+    assert row["direction"] == "反向"
+
+
+def test_fetch_linked_opportunity_overlays_current_when_session_row_has_no_ann(tmp_path) -> None:
+    """未 close 的 session 无 ann_pct；应从 opportunity_current（正向/反向）补全。"""
+    import sqlite3
+
+    from pcp_arbitrage.db import init_db, insert_opportunity_session
+
+    path = str(tmp_path / "sess.db")
+    init_db(path)
+    sid = insert_opportunity_session(
+        path,
+        exchange="okx",
+        contract="BTC-T-80000",
+        direction="反向",
+        started_utc="2026-01-01T00:00:00Z",
+    )
+    con = sqlite3.connect(path)
+    con.execute(
+        "INSERT INTO opportunity_current "
+        "(exchange, contract, direction, updated_at, gross_usdt, fee_usdt, net_usdt, "
+        " tradeable, ann_pct, ann_pct_max, days_to_exp, active) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?,?,1)",
+        (
+            "okx",
+            "BTC-T-80000",
+            "反向",
+            "2026-01-01T00:00:00Z",
+            10.0,
+            1.0,
+            9.0,
+            0.5,
+            12.34,
+            15.0,
+            5.0,
+        ),
+    )
+    con.commit()
+    con.close()
+
+    got = web_dashboard._fetch_linked_opportunity_session(
+        path,
+        sid,
+        exchange="okx",
+        contract="BTC-T-80000",
+        direction_en="reverse",
+    )
+    assert got["ann_pct"] == pytest.approx(12.34)
+    assert got["net_usdt"] == pytest.approx(9.0)
+    assert got["tradeable"] == pytest.approx(0.5)
+
+
+def test_build_payload_includes_recent_closed_positions_and_orders(tmp_path) -> None:
+    """已 closed 的仓位应出现在 positions 中并带上 open+close 订单（此前仅合并 open 与 failed/partial_failed）。"""
+    import sqlite3
+
+    from pcp_arbitrage.db import init_db
+    from pcp_arbitrage.opportunity_dashboard import OpportunityDashboard
+
+    path = str(tmp_path / "closed_pos.db")
+    init_db(path)
+    con = sqlite3.connect(path)
+    con.execute(
+        "INSERT INTO positions (signal_id, exchange, symbol, expiry, strike, direction, status, "
+        "realized_pnl_usdt, opened_at, closed_at, call_inst_id, put_inst_id, future_inst_id) "
+        "VALUES (NULL, 'OKX', 'BTC', '260417', 74500, 'forward', 'closed', 1.0, "
+        "'2026-04-01T00:00:00Z', '2026-04-15T00:00:00Z', 'BTC-USD-260417-74500-C', "
+        "'BTC-USD-260417-74500-P', 'BTC-USD-260417')",
+    )
+    pid = int(con.execute("SELECT last_insert_rowid()").fetchone()[0])
+    con.execute(
+        "INSERT INTO orders (position_id, inst_id, leg, action, order_type, requested_order_type, "
+        "side, qty, limit_px, status, submitted_at, filled_px) "
+        "VALUES (?, 'BTC-USD-260417', 'future', 'open', 'limit', 'limit', 'sell', 1, 74000, "
+        "'filled', '2026-04-01T00:01:00Z', 74000)",
+        (pid,),
+    )
+    con.execute(
+        "INSERT INTO orders (position_id, inst_id, leg, action, order_type, requested_order_type, "
+        "side, qty, limit_px, status, submitted_at, filled_px) "
+        "VALUES (?, 'BTC-USD-260417', 'future', 'close', 'limit', 'limit', 'buy', 1, 74005, "
+        "'filled', '2026-04-15T00:02:00Z', 74005)",
+        (pid,),
+    )
+    con.commit()
+    con.close()
+
+    web_dashboard.update_positions_cache([])
+    dash = OpportunityDashboard(sqlite_path=path)
+    payload = web_dashboard._build_payload(dash, full=True)
+    pos_list = payload.get("positions") or []
+    match = next((p for p in pos_list if p["id"] == pid), None)
+    assert match is not None
+    assert match["status"] == "closed"
+    actions = {o["action"] for o in match.get("orders", [])}
+    assert actions == {"open", "close"}

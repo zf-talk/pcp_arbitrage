@@ -63,7 +63,7 @@ async def _get_okx_balance(cfg: "ExchangeConfig") -> dict | None:
         from pcp_arbitrage.okx_client import OKXRestClient
 
         async with OKXRestClient(
-            cfg.api_key, cfg.secret_key, cfg.passphrase, cfg.is_paper_trading
+            cfg.api_key, cfg.secret_key, cfg.passphrase
         ) as client:
             bal = await client.get_balance()
             total_eq = _sf(bal.get("totalEq"))

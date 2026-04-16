@@ -5,12 +5,11 @@ from __future__ import annotations
 import asyncio
 import datetime
 import logging
-import sys
 import time
 from typing import TYPE_CHECKING
 
 from pcp_arbitrage import notifier
-from pcp_arbitrage.config import AppConfig
+from pcp_arbitrage.config import AppConfig, ExchangeConfig
 from pcp_arbitrage.exchange_symbols import format_strike_display
 from pcp_arbitrage.models import BookSnapshot, FeeRates, Triplet
 from pcp_arbitrage.pcp_calculator import ArbitrageSignal, calculate_forward, calculate_reverse
@@ -30,6 +29,7 @@ logger = logging.getLogger(__name__)
 _dash: OpportunityDashboard | None = None
 _mode: str = "classic"
 _cfg: AppConfig | None = None
+_DASHBOARD_MAX_ROWS: int = 30
 
 # Tracks keys that have already been notified (since last inactive)
 # Key: (exchange, label, direction) -> bool (True = already notified this activation)
@@ -40,10 +40,17 @@ _notified_keys: dict[tuple[str, str, str], bool] = {}
 _LOG_COOLDOWN_SEC: float = 60.0
 _logged_key_times: dict[tuple[str, str, str], float] = {}
 
+# (exchange, label) — 不含 direction — -> (monotonic_ts, annualized_return fraction) 用于「近窗口内年化近重复」判断
+_ann_suppress_state: dict[tuple[str, str], tuple[float, float]] = {}
+
 _monitoring_needed: int = 0
 _monitoring_ready_count: int = 0
 _dashboard_start_event: asyncio.Event | None = None
 _startup_market_sweeps: list[object] = []  # list[Callable[[], Awaitable[None]]]
+_MONITORED_OPPORTUNITY_LOG_INTERVAL_SEC: float = 300.0
+_last_monitored_opportunity_log_ts: float = 0.0
+_last_monitored_opportunity_total: int = 0
+_last_monitored_symbol_prices: dict[str, float] = {}
 
 
 def register_startup_market_sweep(fn: object) -> None:
@@ -52,21 +59,17 @@ def register_startup_market_sweep(fn: object) -> None:
 
 
 def configure_signal_output(cfg: AppConfig) -> None:
-    """Call once after load_config. Dashboard is only used when signal_ui=dashboard and stdout is a TTY."""
-    global _dash, _mode, _cfg, _startup_market_sweeps, _notified_keys, _logged_key_times
+    """Call once after load_config."""
+    global _dash, _mode, _cfg, _startup_market_sweeps, _notified_keys, _logged_key_times, _ann_suppress_state
     _cfg = cfg
     _startup_market_sweeps = []
     _notified_keys = {}
     _logged_key_times = {}
-    _mode = (cfg.signal_ui or "classic").strip().lower()
-    if _mode not in ("classic", "dashboard"):
-        _mode = "classic"
+    _ann_suppress_state = {}
+    _mode = "classic"
     _dash = None
-    needs_dash = (_mode == "dashboard") or cfg.web_dashboard_enabled
+    needs_dash = cfg.web_dashboard_enabled
     if needs_dash:
-        if _mode == "dashboard" and not sys.stdout.isatty():
-            logger.warning("signal_ui=dashboard requires a TTY; falling back to classic")
-            _mode = "classic"
         from pcp_arbitrage.opportunity_dashboard import OpportunityDashboard
 
         sqlite_path = cfg.sqlite_path or None
@@ -92,7 +95,7 @@ def configure_signal_output(cfg: AppConfig) -> None:
                 )
 
         _dash = OpportunityDashboard(
-            max_rows=cfg.signal_dashboard_max_rows,
+            max_rows=_DASHBOARD_MAX_ROWS,
             min_annualized_rate=cfg.min_annualized_rate,
             atm_range=cfg.atm_range,
             min_days_to_expiry=cfg.min_days_to_expiry,
@@ -124,25 +127,15 @@ def _restore_opportunity_rows_from_db(
 
         now = time.time()
         for r in db_rows:
-            key = (
-                r["exchange"],
-                r["contract"].split("-")[0] if "-" in r["contract"] else "",
-                "",
-                0.0,
-                r["direction"],
-            )
-            # reconstruct key properly: (exchange, symbol, expiry, strike, direction)
-            # label format: SYMBOL-EXPIRY-STRIKE
+            dir_key = _direction_key_from_db(r["direction"])
+            # 与 OpportunityDashboard._rows 键一致：(exchange, contract, forward|reverse)
+            key = (r["exchange"], r["contract"], dir_key)
             parts = r["contract"].split("-")
-            sym = parts[0] if parts else ""
-            expiry = parts[1] if len(parts) > 1 else ""
             strike_s = parts[2] if len(parts) > 2 else "0"
             try:
                 strike = float(strike_s.replace(",", ""))
             except ValueError:
                 strike = 0.0
-            dir_key = _direction_key_from_db(r["direction"])
-            key = (r["exchange"], sym, expiry, strike, dir_key)
             dur_sec = r.get("duration_sec")
             active = bool(r["active"])
             if active:
@@ -252,6 +245,52 @@ def notify_monitoring_ready(exchange: str) -> None:
         _dashboard_start_event.set()
 
 
+def _log_monitored_opportunities_if_due() -> None:
+    """Periodically log monitored opportunity counts from dashboard rows."""
+    global _last_monitored_opportunity_log_ts, _last_monitored_opportunity_total
+
+    if _dash is None:
+        return
+    now = time.monotonic()
+    if (
+        _last_monitored_opportunity_log_ts > 0
+        and now - _last_monitored_opportunity_log_ts < _MONITORED_OPPORTUNITY_LOG_INTERVAL_SEC
+    ):
+        return
+    rows = list(_dash._rows.values())
+    total = len(rows)
+    active = sum(1 for row in rows if getattr(row, "active", False))
+    added = total - _last_monitored_opportunity_total
+    if added == 0:
+        return
+    symbols = list(getattr(_dash, "_symbols", []) or [])
+    index_prices = dict(getattr(_dash, "_index_prices", {}) or {})
+    if not symbols:
+        symbols = sorted(index_prices.keys())
+    price_parts: list[str] = []
+    for sym in symbols:
+        px = index_prices.get(sym)
+        if px is None:
+            continue
+        prev_px = _last_monitored_symbol_prices.get(sym)
+        if prev_px is not None and prev_px > 0:
+            diff = px - prev_px
+            pct = (diff / prev_px) * 100.0
+            price_parts.append(f"{sym}={px:.4f} ({diff:+.4f}, {pct:+.2f}%)")
+        else:
+            price_parts.append(f"{sym}={px:.4f} (baseline)")
+        _last_monitored_symbol_prices[sym] = px
+    logger.info(
+        "[signal_output] 监控机会变化: total=%d active=%d 新增=%+d | 监控币种价格: %s",
+        total,
+        active,
+        added,
+        " | ".join(price_parts) if price_parts else "N/A",
+    )
+    _last_monitored_opportunity_total = total
+    _last_monitored_opportunity_log_ts = now
+
+
 def dashboard_enabled() -> bool:
     return _dash is not None
 
@@ -312,6 +351,48 @@ def _triplet_label(t: Triplet) -> str:
     return f"{t.symbol}-{t.expiry}-{format_strike_display(t.symbol, t.strike)}"
 
 
+def _exchange_cfg_by_name(cfg: AppConfig, exchange: str) -> ExchangeConfig | None:
+    """Match YAML exchange keys case-insensitively (e.g. OKX vs okx, Binance vs binance)."""
+    if not cfg.exchanges:
+        return None
+    u = exchange.upper()
+    for name, ec in cfg.exchanges.items():
+        if str(name).upper() == u:
+            return ec
+    return None
+
+
+def _duplicate_ann_opportunity_noise(
+    key: tuple[str, str],
+    ann: float,
+) -> bool:
+    """
+    在 opportunity_ann_suppress_window_sec 内，若与上次记录的年化（小数）相差
+    ≤ opportunity_ann_suppress_max_delta，则视为同一噪声机会，返回 True。
+    key 为 (exchange, label)，**不含 direction**（正/反向共用一条基准）。
+    返回 True 时不更新基准；返回 False 时会刷新基准时间/年化。
+    """
+    cfg = _cfg
+    window = 300.0
+    dmax = 0.01
+    if cfg is not None:
+        window = float(cfg.opportunity_ann_suppress_window_sec)
+        dmax = float(cfg.opportunity_ann_suppress_max_delta)
+    now = time.monotonic()
+    prev = _ann_suppress_state.get(key)
+    if prev is None:
+        _ann_suppress_state[key] = (now, ann)
+        return False
+    t0, a0 = prev
+    if now - t0 >= window:
+        _ann_suppress_state[key] = (now, ann)
+        return False
+    if abs(ann - a0) > dmax:
+        _ann_suppress_state[key] = (now, ann)
+        return False
+    return True
+
+
 def _trace_evaluation(
     exchange: str,
     triplet: Triplet,
@@ -346,10 +427,25 @@ def emit_opportunity_evaluation(
     min_annualized_rate: float,
     signal_id: int | None = None,
 ) -> None:
-    _trace_evaluation(exchange, triplet, direction, sig, min_annualized_rate)
-    is_active = sig is not None and sig.annualized_return >= min_annualized_rate
     label = _triplet_label(triplet)
     notif_key = (exchange, label, direction)
+    ann_suppress_key = (exchange, label)
+
+    if sig is None:
+        _ann_suppress_state.pop(ann_suppress_key, None)
+        _trace_evaluation(exchange, triplet, direction, sig, min_annualized_rate)
+        is_active = False
+        ann_duplicate_noise = False
+    else:
+        is_active = sig.annualized_return >= min_annualized_rate
+        if not is_active:
+            _ann_suppress_state.pop(ann_suppress_key, None)
+        ann_duplicate_noise = (
+            is_active
+            and _duplicate_ann_opportunity_noise(ann_suppress_key, sig.annualized_return)
+        )
+        if not ann_duplicate_noise:
+            _trace_evaluation(exchange, triplet, direction, sig, min_annualized_rate)
 
     if is_active:
         assert sig is not None
@@ -368,7 +464,10 @@ def emit_opportunity_evaluation(
         meets_order = order_threshold is not None and sig.annualized_return >= order_threshold
         now = time.monotonic()
         last_logged = _logged_key_times.get(notif_key, 0.0)
-        if now - last_logged >= _LOG_COOLDOWN_SEC:
+        if (
+            not ann_duplicate_noise
+            and now - last_logged >= _LOG_COOLDOWN_SEC
+        ):
             logger.info(
                 "[%s %s %s] 年化 %.1f%%，下单阈值 %s，%s",
                 exchange,
@@ -380,7 +479,8 @@ def emit_opportunity_evaluation(
             )
             _logged_key_times[notif_key] = now
         if (
-            _cfg is not None
+            not ann_duplicate_noise
+            and _cfg is not None
             and sig.annualized_return >= _cfg.order_min_annualized_rate
             and not _notified_keys.get(notif_key, False)
         ):
@@ -411,12 +511,21 @@ def emit_opportunity_evaluation(
                 pass
             from pcp_arbitrage import order_manager as _om
 
-            try:
-                asyncio.create_task(
-                    _om.submit_entry(triplet, sig, signal_id, _cfg, _cfg.sqlite_path)
+            ex_cfg = _exchange_cfg_by_name(_cfg, exchange)
+            if ex_cfg is None or not ex_cfg.arbitrage_enabled:
+                logger.info(
+                    "[%s %s %s] 已达下单阈值但未开启 arbitrage_enabled，跳过自动下单",
+                    exchange,
+                    label,
+                    direction,
                 )
-            except RuntimeError:
-                pass
+            else:
+                try:
+                    asyncio.create_task(
+                        _om.submit_entry(triplet, sig, signal_id, _cfg, _cfg.sqlite_path)
+                    )
+                except RuntimeError:
+                    pass
     # Key is only reset when the opportunity goes fully inactive (below display threshold).
     # If the signal dips below order_min_annualized_rate but stays above min_annualized_rate,
     # we intentionally do NOT re-notify — this avoids alert spam for noisy signals.
@@ -424,7 +533,13 @@ def emit_opportunity_evaluation(
         _notified_keys.pop(notif_key, None)
         _logged_key_times.pop(notif_key, None)
 
-    if _dash is None and _mode == "classic" and sig is not None and sig.annualized_return >= min_annualized_rate:
+    if (
+        _dash is None
+        and _mode == "classic"
+        and sig is not None
+        and sig.annualized_return >= min_annualized_rate
+        and not ann_duplicate_noise
+    ):
         print_signal(sig)
 
 
@@ -492,6 +607,7 @@ async def run_opportunity_sqlite_loop() -> None:
     init_db(_cfg.sqlite_path)
     while True:
         await asyncio.sleep(10)
+        _log_monitored_opportunities_if_due()
         if _dash is not None and _cfg is not None and _cfg.sqlite_path:
             try:
                 upsert_opportunity_current(_cfg.sqlite_path, list(_dash._rows.values()))
@@ -570,9 +686,9 @@ async def run_dashboard_loop() -> None:
             live.update(_dash.build_rich_table())
 
 
-async def run_web_dashboard_loop(host: str, port: int, width: int) -> None:
+async def run_web_dashboard_loop(host: str, port: int) -> None:
     if _dash is None:
         return
     from pcp_arbitrage.web_dashboard import run_web_dashboard_loop as _impl
 
-    await _impl(_dash, host, port, width, _dashboard_start_event)
+    await _impl(_dash, host, port, _dashboard_start_event)

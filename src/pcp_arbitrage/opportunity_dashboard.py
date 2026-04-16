@@ -56,7 +56,8 @@ class _Row:
     max_ann_pct: float  # 本组合历史上出现过的最高年化%（有信号即参与比较）
     net: float
     fee: float
-    tradeable: float  # 三腿对手盘挂量最小（与交易所深度口径一致）
+    tradeable: float  # 三腿深度换算后的可交易标的币量（BTC 等）
+    depth_contracts: float = 1.0  # 三腿对手盘最优档最小张数（与 OKX sz 一致）
     last_active_eval: float | None = None
     strike: float | None = None
     call_px_usdt: float | None = None
@@ -158,8 +159,13 @@ def _ann_dur_cell(ann_pct: float, dur_str: str) -> str:
     return f"{ann_pct:.2f}% / {dur_str}"
 
 
+def contract_label_for_triplet(triplet: Triplet) -> str:
+    """与 DB ``opportunity_current.contract``、日志里的合约名一致；避免行权价浮点噪声拆成多行。"""
+    return f"{triplet.symbol}-{triplet.expiry}-{format_strike_display(triplet.symbol, triplet.strike)}"
+
+
 class OpportunityDashboard:
-    """Keeps one row per (exchange, triplet, direction); inactive only on re-eval that fails threshold."""
+    """Keeps one row per (exchange, contract label, direction); inactive only on re-eval that fails threshold."""
 
     def __init__(
         self,
@@ -178,23 +184,24 @@ class OpportunityDashboard:
         self._symbols = list(symbols) if symbols else []
         self._sqlite_path = sqlite_path
         self._runner_meta: dict[str, _RunnerMeta] = {}
-        self._rows: dict[tuple[str, str, str, float, str], _Row] = {}
-        # per-triplet live snapshot for web dashboard: key=(exchange,symbol,expiry,strike)
-        self._triplet_snaps: dict[tuple[str, str, str, float], _TripletSnap] = {}
+        # (exchange, contract_label, direction) — contract_label 与 format_strike_display 一致，不按裸 float strike 区分
+        self._rows: dict[tuple[str, str, str], _Row] = {}
+        # per-triplet live snapshot for web dashboard: key=(exchange, contract_label)
+        self._triplet_snaps: dict[tuple[str, str], _TripletSnap] = {}
         self._started_at = time.time()
         # {symbol: price} — updated by each exchange runner via update_index_price()
         self._index_prices: dict[str, float] = {}
         # optional asyncio.Queue for event-driven price push to web dashboard
         self._price_event_queue: object = None  # set to asyncio.Queue by web_dashboard
         # Restored-from-SQLite rows that were active: re-checked once after WS books populate.
-        self._startup_revalidate_keys: set[tuple[str, str, str, float, str]] = set()
+        self._startup_revalidate_keys: set[tuple[str, str, str]] = set()
 
-    def note_startup_revalidate_key(self, key: tuple[str, str, str, float, str]) -> None:
+    def note_startup_revalidate_key(self, key: tuple[str, str, str]) -> None:
         self._startup_revalidate_keys.add(key)
 
     def clear_startup_revalidate_key(self, exchange: str, triplet: Triplet, direction: str) -> None:
         self._startup_revalidate_keys.discard(
-            (exchange, triplet.symbol, triplet.expiry, triplet.strike, direction)
+            (exchange, contract_label_for_triplet(triplet), direction)
         )
 
     def finalize_startup_revalidate_stale(self) -> None:
@@ -391,6 +398,13 @@ class OpportunityDashboard:
                 contract=row.label,
                 direction=row.direction_cn,
                 started_utc=started,
+                gross_usdt=row.gross,
+                fee_usdt=row.fee,
+                net_usdt=row.net,
+                tradeable=row.tradeable,
+                ann_pct=row.ann_pct,
+                ann_pct_max=row.max_ann_pct,
+                days_to_exp=row.days_to_expiry,
             )
         except Exception as exc:
             logger.warning("[db] insert opportunity_session failed: %s", exc)
@@ -441,8 +455,9 @@ class OpportunityDashboard:
         min_annualized_rate: float,
     ) -> int | None:
         """Record one evaluation tick. Returns the active session id (or None)."""
-        key = (exchange, triplet.symbol, triplet.expiry, triplet.strike, direction)
-        tkey = (exchange, triplet.symbol, triplet.expiry, triplet.strike)
+        label = contract_label_for_triplet(triplet)
+        key = (exchange, label, direction)
+        tkey = (exchange, label)
         now = time.time()
         qualified = sig is not None and sig.annualized_return >= min_annualized_rate
 
@@ -493,7 +508,7 @@ class OpportunityDashboard:
             if row is None:
                 self._rows[key] = _Row(
                     exchange=exchange,
-                    label=f"{triplet.symbol}-{triplet.expiry}-{format_strike_display(triplet.symbol, triplet.strike)}",
+                    label=label,
                     direction_cn=_direction_cn(direction),
                     active=True,
                     first_active=now,
@@ -506,6 +521,7 @@ class OpportunityDashboard:
                     net=sig.net_profit,
                     fee=sig.total_fee,
                     tradeable=sig.tradeable_qty,
+                    depth_contracts=sig.depth_contracts,
                     strike=triplet.strike,
                     call_px_usdt=sig.call_price,
                     put_px_usdt=sig.put_price,
@@ -533,6 +549,7 @@ class OpportunityDashboard:
                 row.net = sig.net_profit
                 row.fee = sig.total_fee
                 row.tradeable = sig.tradeable_qty
+                row.depth_contracts = sig.depth_contracts
                 row.strike = triplet.strike
                 row.call_px_usdt = sig.call_price
                 row.put_px_usdt = sig.put_price

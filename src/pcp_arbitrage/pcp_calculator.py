@@ -97,8 +97,10 @@ class ArbitrageSignal:
     days_to_expiry: float
     # 与 calculate_* 中 index_for_fee 一致（用于期权手续费名义等；USDT）
     index_for_fee_usdt: float = 0.0
-    # 三腿中与套利方向对应的对手盘挂量取最小（张数/数量，与交易所口径一致）
+    # 三腿深度换算后的可交易标的币数量（BTC 等，与 order_manager lot_size / 余额约束同一口径）
     tradeable_qty: float = 0.0
+    # 三腿对手盘最优档最小张数（与交易所盘口 sz 一致；OKX 下单各腿用该张数）
+    depth_contracts: float = 0.0
     call_fee: float = 0.0  # 单边 call 手续费 (USDT)
     put_fee: float = 0.0  # 单边 put 手续费 (USDT)
     fut_fee: float = 0.0  # 单边 future 手续费 (USDT)
@@ -142,12 +144,12 @@ def _future_fee(
     return future_price * lot_size * future_rate
 
 
-def _min_tradeable_forward(
+def _min_depth_contracts_forward(
     call_snap: BookSnapshot,
     put_snap: BookSnapshot,
     fut_snap: BookSnapshot,
 ) -> float:
-    """正向：买 C@ask、卖 P@bid、卖 F@bid — 取三边对手盘量最小。"""
+    """正向：买 C@ask、卖 P@bid、卖 F@bid — 各腿张数取最小。"""
     return min(
         max(0.0, call_snap.ask_sz),
         max(0.0, put_snap.bid_sz),
@@ -155,17 +157,60 @@ def _min_tradeable_forward(
     )
 
 
-def _min_tradeable_reverse(
+def _min_depth_contracts_reverse(
     call_snap: BookSnapshot,
     put_snap: BookSnapshot,
     fut_snap: BookSnapshot,
 ) -> float:
-    """反向：卖 C@bid、买 P@ask、买 F@ask。"""
+    """反向：卖 C@bid、买 P@ask、买 F@ask — 各腿张数取最小。"""
     return min(
         max(0.0, call_snap.bid_sz),
         max(0.0, put_snap.ask_sz),
         max(0.0, fut_snap.ask_sz),
     )
+
+
+def _min_tradeable_forward(
+    call_snap: BookSnapshot,
+    put_snap: BookSnapshot,
+    fut_snap: BookSnapshot,
+    lot_size: float,
+    spot_price: float,
+    future_inverse_usd_face: float | None = None,
+) -> float:
+    """正向：买 C@ask、卖 P@bid、卖 F@bid — 各腿张数换算为标的币数量后取最小。
+
+    期权：张数 × lot_size（≈ ctVal×ctMult BTC/张，与配置 contracts.lot_size 一致）。
+    币本位反向期货：张数 × (USD 面值 / 指数价) = 对应 BTC 名义。
+    若未提供 inverse 面值，则退回张数 × lot_size（与旧行为接近，仅作兼容）。
+    """
+    c_btc = max(0.0, call_snap.ask_sz) * lot_size
+    p_btc = max(0.0, put_snap.bid_sz) * lot_size
+    fut_sz = max(0.0, fut_snap.bid_sz)
+    if future_inverse_usd_face is not None and future_inverse_usd_face > 0 and spot_price > 0:
+        f_btc = fut_sz * (future_inverse_usd_face / spot_price)
+    else:
+        f_btc = fut_sz * lot_size
+    return min(c_btc, p_btc, f_btc)
+
+
+def _min_tradeable_reverse(
+    call_snap: BookSnapshot,
+    put_snap: BookSnapshot,
+    fut_snap: BookSnapshot,
+    lot_size: float,
+    spot_price: float,
+    future_inverse_usd_face: float | None = None,
+) -> float:
+    """反向：卖 C@bid、买 P@ask、买 F@ask — 标的币数量取最小。"""
+    c_btc = max(0.0, call_snap.bid_sz) * lot_size
+    p_btc = max(0.0, put_snap.ask_sz) * lot_size
+    fut_sz = max(0.0, fut_snap.ask_sz)
+    if future_inverse_usd_face is not None and future_inverse_usd_face > 0 and spot_price > 0:
+        f_btc = fut_sz * (future_inverse_usd_face / spot_price)
+    else:
+        f_btc = fut_sz * lot_size
+    return min(c_btc, p_btc, f_btc)
 
 
 def _integrity_check(
@@ -232,7 +277,15 @@ def calculate_forward(
         return None
 
     ann = (net / K) * (365 / days_to_expiry)
-    tqty = _min_tradeable_forward(call_snap, put_snap, fut_snap)
+    tqty = _min_tradeable_forward(
+        call_snap,
+        put_snap,
+        fut_snap,
+        lot_size,
+        spot_price,
+        future_inverse_usd_face,
+    )
+    dcontracts = _min_depth_contracts_forward(call_snap, put_snap, fut_snap)
 
     return ArbitrageSignal(
         direction="forward",
@@ -253,6 +306,7 @@ def calculate_forward(
         days_to_expiry=days_to_expiry,
         index_for_fee_usdt=idx,
         tradeable_qty=tqty,
+        depth_contracts=dcontracts,
     )
 
 
@@ -303,7 +357,15 @@ def calculate_reverse(
         return None
 
     ann = (net / K) * (365 / days_to_expiry)
-    tqty = _min_tradeable_reverse(call_snap, put_snap, fut_snap)
+    tqty = _min_tradeable_reverse(
+        call_snap,
+        put_snap,
+        fut_snap,
+        lot_size,
+        spot_price,
+        future_inverse_usd_face,
+    )
+    dcontracts = _min_depth_contracts_reverse(call_snap, put_snap, fut_snap)
 
     return ArbitrageSignal(
         direction="reverse",
@@ -324,4 +386,5 @@ def calculate_reverse(
         days_to_expiry=days_to_expiry,
         index_for_fee_usdt=idx,
         tradeable_qty=tqty,
+        depth_contracts=dcontracts,
     )

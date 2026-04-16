@@ -136,26 +136,22 @@ cp config.yaml.example config.yaml   # 然后填入你的密钥
 exchanges:
   okx:
     enabled: true
-    margin_type: coin        # coin = 币本位
     api_key: "..."
     secret_key: "..."
     passphrase: "..."        # 仅 OKX 使用
 
   binance:
     enabled: false
-    margin_type: usdt
     api_key: "..."
     secret_key: "..."
 
   deribit:
     enabled: false
-    margin_type: coin
     api_key: "..."           # client_id
     secret_key: "..."        # client_secret
 
   deribit_linear:
     enabled: false
-    margin_type: usdc
     api_key: "..."           # 与 deribit 相同的 client_id
     secret_key: "..."        # 与 deribit 相同的 client_secret
 
@@ -166,8 +162,6 @@ arbitrage:
     - BTC
     - ETH
   stale_threshold_ms: 5000
-  signal_ui: classic          # classic = 多行明细；dashboard = 类 top 表格（需交互式终端）
-  signal_dashboard_max_rows: 30
 ```
 
 ### 标的（`symbols`）
@@ -176,12 +170,7 @@ arbitrage:
 
 **合约数量（lot_size）** 默认在代码中 `DEFAULT_LOT_SIZES`（`config.py`）定义；仅在需要覆盖某标的时再在 YAML 写 `contracts.lot_size`。
 
-### 信号展示（`signal_ui`）
-
-- **`classic`（默认）**：每次满足最小年化时打印多行明细（与旧版一致）。
-- **`dashboard`**：在 **交互式 TTY** 下用类 `top` 的表格刷新 stdout；**`inactive` 仅在同一 triplet+方向因行情 tick 被重算且结果不满足阈值时**出现，不会因为「久无推送」而误判。若某机会曾显示 active，但之后很长时间没有任何一脚触发重算，该行可能一直保持 active，直到任一脚有更新并重算（见英文 README 同节）。
-
-仪表盘用 **[Rich](https://github.com/Textualize/rich)** 的 `Live` + `Table`（`screen=True` 走备用屏幕），重绘不污染主滚动区，进程退出时由 Rich 还原。默认 **`dashboard_quiet_exchanges: true`** 会把 `pcp_arbitrage.exchanges` 与 `okx_client` 的日志降到 WARNING，减轻 **stderr** 刷屏；需要调试时可设为 `false`，或在 `logging.levels` 里单独指定级别（会覆盖该默认）。
+默认 **`dashboard_quiet_exchanges: true`** 会把 `pcp_arbitrage.exchanges` 与 `okx_client` 的日志降到 WARNING，减轻仪表盘场景下的 **stderr** 刷屏；需要调试时可设为 `false`，或在 `logging.levels` 里单独指定级别（会覆盖该默认）。
 
 ## 运行
 

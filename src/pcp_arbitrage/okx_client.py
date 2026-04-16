@@ -11,9 +11,7 @@ import aiohttp
 logger = logging.getLogger(__name__)
 
 BASE_REST = "https://www.okx.com"
-BASE_REST_PAPER = "https://www.okx.com"  # same host, paper flag in header
 WS_PUBLIC = "wss://ws.okx.com:8443/ws/v5/public"
-WS_PUBLIC_PAPER = "wss://wspap.okx.com:8443/ws/v5/public?brokerId=9999"
 WS_PRIVATE = "wss://ws.okx.com:8443/ws/v5/private"
 
 
@@ -28,11 +26,10 @@ def _sign(secret: str, ts: str, method: str, path: str, body: str = "") -> str:
 
 
 class OKXRestClient:
-    def __init__(self, api_key: str, secret: str, passphrase: str, is_paper: bool = False):
+    def __init__(self, api_key: str, secret: str, passphrase: str):
         self._api_key = api_key
         self._secret = secret
         self._passphrase = passphrase
-        self._is_paper = is_paper
         self._session: aiohttp.ClientSession | None = None
 
     async def __aenter__(self):
@@ -53,8 +50,6 @@ class OKXRestClient:
             "OK-ACCESS-PASSPHRASE": self._passphrase,
             "Content-Type": "application/json",
         }
-        if self._is_paper:
-            headers["x-simulated-trading"] = "1"
         return headers
 
     async def _get(self, path: str, params: dict | None = None, auth: bool = False) -> dict:

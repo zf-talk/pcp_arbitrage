@@ -1,6 +1,7 @@
 """Tests for submit_exit: reverse 3-leg exit orders and exit condition helpers."""
 from __future__ import annotations
 
+import contextlib
 import datetime
 import sqlite3
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -33,7 +34,6 @@ def _make_cfg(db_path: str = ":memory:") -> AppConfig:
                 api_key="key",
                 secret_key="secret",
                 passphrase="pass",
-                is_paper_trading=True,
             )
         },
         symbols=["BTC"],
@@ -64,13 +64,32 @@ def _insert_open_position(db_path: str, *, expiry: str = "260101", current_mark:
                  "2026-01-01T00:00:00.000Z", current_mark, None),
             )
             pid = int(cur.lastrowid)
-            # Insert 3 entry orders marked filled
-            for leg, side, px in [("call", "buy", 500.0), ("put", "sell", 480.0), ("future", "sell", 80000.0)]:
+            # Insert 3 entry orders marked filled (schema: action, requested_order_type, inst_id)
+            trip = [
+                ("call", "buy", 500.0, "BTC-USD-260101-80000-C"),
+                ("put", "sell", 480.0, "BTC-USD-260101-80000-P"),
+                ("future", "sell", 80000.0, "BTC-USD-260101"),
+            ]
+            for leg, side, px, iid in trip:
                 conn.execute(
                     "INSERT INTO orders "
-                    "(position_id, leg, order_type, side, limit_px, filled_px, qty, status, submitted_at) "
-                    "VALUES (?,?,?,?,?,?,?,?,?)",
-                    (pid, leg, "entry", side, px, px, 1.0, "filled", "2026-01-01T00:00:00.000Z"),
+                    "(position_id, inst_id, leg, action, order_type, requested_order_type, "
+                    "side, limit_px, filled_px, qty, status, submitted_at) "
+                    "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (
+                        pid,
+                        iid,
+                        leg,
+                        "open",
+                        "limit",
+                        "limit",
+                        side,
+                        px,
+                        px,
+                        1.0,
+                        "filled",
+                        "2026-01-01T00:00:00.000Z",
+                    ),
                 )
         return pid
     finally:
@@ -91,21 +110,21 @@ def _get_position_status(db_path: str, position_id: int) -> dict:
 
 
 async def _mock_place_order(session, *, inst_id, td_mode, side, ord_type, px, sz,
-                             api_key, secret, passphrase, is_paper):
+                             api_key, secret, passphrase, **kwargs):
     return f"exit_ord_{inst_id}"
 
 
-async def _mock_poll_filled(session, *, inst_id, ord_id, api_key, secret, passphrase, is_paper,
-                             poll_interval=2.0, poll_timeout=30.0):
+async def _mock_poll_filled(session, *, inst_id, ord_id, api_key, secret, passphrase,
+                             poll_interval=2.0, poll_timeout=30.0, **kwargs):
     return {"ordId": ord_id, "state": "filled", "avgPx": "550.0", "px": "550.0"}
 
 
-async def _mock_poll_timeout(session, *, inst_id, ord_id, api_key, secret, passphrase, is_paper,
-                              poll_interval=2.0, poll_timeout=30.0):
+async def _mock_poll_timeout(session, *, inst_id, ord_id, api_key, secret, passphrase,
+                              poll_interval=2.0, poll_timeout=30.0, **kwargs):
     return None
 
 
-async def _mock_cancel(session, *, inst_id, ord_id, api_key, secret, passphrase, is_paper):
+async def _mock_cancel(session, *, inst_id, ord_id, api_key, secret, passphrase, **kwargs):
     pass
 
 
@@ -116,6 +135,21 @@ def _make_mock_session_cm():
     session_cm.__aenter__ = AsyncMock(return_value=session)
     session_cm.__aexit__ = AsyncMock(return_value=False)
     return session_cm
+
+
+@contextlib.contextmanager
+def _okx_exit_http_mocks():
+    """No real HTTP: hedge check + order book for submit_exit OKX path."""
+    with patch.object(
+        om,
+        "okx_db_entry_matches_exchange_positions",
+        new=AsyncMock(return_value=(True, "")),
+    ), patch.object(
+        om,
+        "_fetch_order_book_top",
+        new=AsyncMock(return_value=(100.0, 101.0)),
+    ):
+        yield
 
 
 # ---------------------------------------------------------------------------
@@ -176,6 +210,7 @@ async def test_submit_exit_all_filled_closes_position(tmp_path):
 
     position = {
         "id": pid,
+        "exchange": "OKX",
         "status": "open",
         "symbol": "BTC",
         "expiry": "260101",
@@ -184,7 +219,8 @@ async def test_submit_exit_all_filled_closes_position(tmp_path):
         "current_mark_usdt": 80000.0,
     }
 
-    with patch.object(om, "_place_order", _mock_place_order), \
+    with _okx_exit_http_mocks(), \
+         patch.object(om, "_place_order", _mock_place_order), \
          patch.object(om, "_poll_order_fill", _mock_poll_filled), \
          patch.object(om, "_cancel_order", _mock_cancel), \
          patch("aiohttp.ClientSession", return_value=_make_mock_session_cm()), \
@@ -217,6 +253,7 @@ async def test_submit_exit_timeout_marks_partial_failed(tmp_path):
 
     position = {
         "id": pid,
+        "exchange": "OKX",
         "status": "open",
         "symbol": "BTC",
         "expiry": "260101",
@@ -225,7 +262,9 @@ async def test_submit_exit_timeout_marks_partial_failed(tmp_path):
         "current_mark_usdt": 80000.0,
     }
 
-    with patch.object(om, "_place_order", _mock_place_order), \
+    with _okx_exit_http_mocks(), \
+         patch.object(om, "_escalating_exit_loop_okx", new=AsyncMock(return_value=(False, 0.0))), \
+         patch.object(om, "_place_order", _mock_place_order), \
          patch.object(om, "_poll_order_fill", _mock_poll_timeout), \
          patch.object(om, "_cancel_order", _mock_cancel), \
          patch("aiohttp.ClientSession", return_value=_make_mock_session_cm()), \
@@ -262,6 +301,7 @@ async def test_submit_exit_skips_if_already_closing(tmp_path):
     cfg = _make_cfg(db_path)
     position = {
         "id": pid,
+        "exchange": "OKX",
         "status": "closing",  # <-- already closing
         "symbol": "BTC",
         "expiry": "260101",
@@ -269,7 +309,8 @@ async def test_submit_exit_skips_if_already_closing(tmp_path):
         "direction": "forward",
     }
 
-    with patch.object(om, "_place_order", _mock_place_order):
+    with _okx_exit_http_mocks(), patch.object(om, "_place_order", _mock_place_order), \
+         patch("aiohttp.ClientSession", return_value=_make_mock_session_cm()):
         await om.submit_exit(position, cfg, db_path)
 
     # _place_order should NOT have been called since status is 'closing'
@@ -298,6 +339,7 @@ async def test_submit_exit_success_telegram_contains_money_emoji(tmp_path):
 
     position = {
         "id": pid,
+        "exchange": "OKX",
         "status": "open",
         "symbol": "BTC",
         "expiry": "260101",
@@ -311,7 +353,8 @@ async def test_submit_exit_success_telegram_contains_money_emoji(tmp_path):
     async def capture_tg(tg_cfg, text):
         sent_messages.append(text)
 
-    with patch.object(om, "_place_order", _mock_place_order), \
+    with _okx_exit_http_mocks(), \
+         patch.object(om, "_place_order", _mock_place_order), \
          patch.object(om, "_poll_order_fill", _mock_poll_filled), \
          patch.object(om, "_cancel_order", _mock_cancel), \
          patch("aiohttp.ClientSession", return_value=_make_mock_session_cm()), \
@@ -332,6 +375,7 @@ async def test_submit_exit_failure_telegram_contains_warning_emoji(tmp_path):
 
     position = {
         "id": pid,
+        "exchange": "OKX",
         "status": "open",
         "symbol": "BTC",
         "expiry": "260101",
@@ -345,7 +389,9 @@ async def test_submit_exit_failure_telegram_contains_warning_emoji(tmp_path):
     async def capture_tg(tg_cfg, text):
         sent_messages.append(text)
 
-    with patch.object(om, "_place_order", _mock_place_order), \
+    with _okx_exit_http_mocks(), \
+         patch.object(om, "_escalating_exit_loop_okx", new=AsyncMock(return_value=(False, 0.0))), \
+         patch.object(om, "_place_order", _mock_place_order), \
          patch.object(om, "_poll_order_fill", _mock_poll_timeout), \
          patch.object(om, "_cancel_order", _mock_cancel), \
          patch("aiohttp.ClientSession", return_value=_make_mock_session_cm()), \
@@ -371,6 +417,7 @@ async def test_submit_exit_realized_pnl_is_numeric(tmp_path):
 
     position = {
         "id": pid,
+        "exchange": "OKX",
         "status": "open",
         "symbol": "BTC",
         "expiry": "260101",
@@ -379,7 +426,8 @@ async def test_submit_exit_realized_pnl_is_numeric(tmp_path):
         "current_mark_usdt": 80000.0,
     }
 
-    with patch.object(om, "_place_order", _mock_place_order), \
+    with _okx_exit_http_mocks(), \
+         patch.object(om, "_place_order", _mock_place_order), \
          patch.object(om, "_poll_order_fill", _mock_poll_filled), \
          patch.object(om, "_cancel_order", _mock_cancel), \
          patch("aiohttp.ClientSession", return_value=_make_mock_session_cm()), \

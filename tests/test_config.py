@@ -42,15 +42,19 @@ def test_config_stale_threshold_ms():
     assert cfg.stale_threshold_ms == 5000
 
 
+def test_config_maker_chase_defaults():
+    cfg = load_config(FIXTURE)
+    assert cfg.maker_chase_secs == 60
+    assert cfg.maker_chase_max_minutes == 3
+
+
 def test_config_tick_interval_sec_default():
     cfg = load_config(FIXTURE)
     assert cfg.tick_interval_sec == 0.0
 
 
-def test_config_signal_ui():
+def test_config_dashboard_quiet_exchanges_default():
     cfg = load_config(FIXTURE)
-    assert cfg.signal_ui == "classic"
-    assert cfg.signal_dashboard_max_rows == 30
     assert cfg.dashboard_quiet_exchanges is True
 
 
@@ -72,7 +76,6 @@ def test_exchange_config_parsed():
     assert okx.margin_type == "coin"
     assert okx.api_key == "test_key"
     assert okx.passphrase == "test_pass"
-    assert okx.is_paper_trading is False
 
 
 def test_lot_size_yaml_override_merges_with_defaults():
@@ -106,8 +109,8 @@ contracts:
         tmp.unlink()
 
 
-def test_exchange_config_margin_type_default():
-    """margin_type defaults to 'coin' when omitted from YAML."""
+def test_exchange_config_margin_type_fixed_by_exchange_name():
+    """margin_type is fixed by exchange name, not YAML value."""
     raw_yaml = """
 exchanges:
   okx:
@@ -143,4 +146,30 @@ def test_binance_exchange_config_parsed():
     assert binance.enabled is False
     assert binance.margin_type == "usdt"
     assert binance.passphrase == ""   # sentinel: not in YAML, defaults to ""
-    assert binance.is_paper_trading is False
+
+
+def test_exchange_config_margin_type_ignores_yaml_value():
+    raw_yaml = """
+exchanges:
+  binance:
+    enabled: true
+    margin_type: coin
+    api_key: "k"
+    secret_key: "s"
+arbitrage:
+  min_annualized_rate: 0.01
+  atm_range: 0.20
+  symbols: [BTC]
+  stale_threshold_ms: 5000
+"""
+    import pathlib
+    import tempfile
+
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False) as f:
+        f.write(raw_yaml)
+        tmp = pathlib.Path(f.name)
+    try:
+        cfg = load_config(tmp)
+        assert cfg.exchanges["binance"].margin_type == "usdt"
+    finally:
+        tmp.unlink()

@@ -16,7 +16,7 @@ class BookSnapshot:
     bid: float
     ask: float
     ts: int  # millisecond timestamp from WebSocket push
-    # 最优档挂单量（与交易所推送一致：期权/期货合约张数或标的数量）
+    # 最优档挂单量（与交易所推送一致：期权/期货均为「张」等合约张数）
     bid_sz: float = 0.0  # 卖单吃 bid 时可成交量
     ask_sz: float = 0.0  # 买单吃 ask 时可成交量
 

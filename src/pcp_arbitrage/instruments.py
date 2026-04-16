@@ -74,7 +74,8 @@ def build_triplets(
             put_map[key] = opt
 
     triplets: list[Triplet] = []
-    warned_expiries: set[str] = set()
+    # 按 (标的, 到期日) 分别告警：BTC 某日无期货不影响 ETH 同日的提示与 triplet
+    warned_missing_future: set[tuple[str, str]] = set()
 
     for key, call_opt in call_map.items():
         sym, exp, strike = key
@@ -95,12 +96,14 @@ def build_triplets(
 
         fut_id = future_index.get(sym, {}).get(exp)
         if fut_id is None:
-            if exp not in warned_expiries:
+            wkey = (sym, exp)
+            if wkey not in warned_missing_future:
                 logger.warning(
-                    "[instruments] No %s future found for %s expiry %s — dropping all triplets for this expiry",
+                    "[instruments] No %s future found for %s expiry %s — "
+                    "skipping triplets for this symbol/expiry (other symbols unaffected)",
                     margin_label, sym, exp,
                 )
-                warned_expiries.add(exp)
+                warned_missing_future.add(wkey)
             continue
 
         put_opt = put_map[key]

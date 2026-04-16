@@ -71,13 +71,12 @@
 
 - **套利筛选**：`symbols`、`min_annualized_rate`、`atm_range`、`min_days_to_expiry`、`stale_threshold_ms`、`lot_size`。
 - **下单阈值**：`order_min_annualized_rate`（高于「展示/记录」阈值时才视为触发自动下单与一次性通知）。
-- **信号 UI**：`signal_ui` = `classic` | `dashboard`（全屏表需 TTY）。
 - **追踪**：`opportunity_csv_*`、`pairing_log_dir`、`sqlite_path`。
 - **Web**：`web_dashboard_*`。
 - **风控与平仓**：`pnl_alert_threshold_pct`、`exit_days_before_expiry`、`exit_target_profit_pct`（持仓跟踪与平仓逻辑使用）。
-- **平仓升级重试**：`exit_maker_chase_secs`（maker 追单间隔，默认 60s）、`exit_taker_escalate_secs`（切 taker 总超时，默认 300s）、`exit_monitor_interval_secs`（守护协程扫描间隔，默认 10s）。
+- **开平仓追单参数**：`maker_chase_secs`（maker 轮询窗口，超时后切 taker，默认 60s）、`maker_chase_max_minutes`（开/平仓总追单上限，默认 3 分钟）、`exit_monitor_interval_secs`（守护协程扫描间隔，默认 10s）。
 - **开仓仓位控制**：`entry_max_trade_pct`（单笔最多占账户总权益比例，默认 20%）、`entry_reserve_pct`（账户预留底线，默认 10%）。
-- **交易所**：`ExchangeConfig` 含 `arbitrage_enabled`、API 凭证、`margin_type`（影响期货保证金标签：币本位 `USD` / U 本位 `USDT` / USDC 等）。
+- **交易所**：`ExchangeConfig` 含 `arbitrage_enabled`、API 凭证；`margin_type` 由交易所名在代码中固化（非 YAML 配置项）。
 
 各字段来源见 `config.py` 与仓库中的 `config.yaml.example`（勿将真实密钥提交版本库）。
 
@@ -100,7 +99,7 @@
 3. `emit_opportunity_evaluation`：
    - 写入 tracing（CSV 快照）；
    - 若年化 ≥ `min_annualized_rate`：更新 `OpportunityDashboard` 行；若仅 classic 模式则 `print_signal`；
-   - 若年化 ≥ `order_min_annualized_rate` 且该 `(exchange, label, direction)` 尚未在本轮「激活」内通知过：Telegram、Web `push_notification`、并 `asyncio.create_task(order_manager.submit_entry(...))`（见下节说明）。
+   - 若年化 ≥ `order_min_annualized_rate` 且该 `(exchange, label, direction)` 尚未在本轮「激活」内通知过：Telegram、Web `push_notification`；**仅当** 该交易所配置存在且 `ExchangeConfig.arbitrage_enabled == true`（键名大小写不敏感）时，才 `asyncio.create_task(order_manager.submit_entry(...))`。否则仅记录日志，不自动下单（Web 手动下单不受此门闸约束，见 `order-flow.md`）。
 
 ### 4.3 持久化与面板
 
@@ -109,7 +108,6 @@
 | `run_opportunity_sqlite_loop` | 约每 10s 将当前机会行 `upsert` 到 `opportunity_current` |
 | `run_triplet_db_refresh_loop` | 本地午夜重刷 `triplets` 表 |
 | `run_opportunity_csv_loop` | 按间隔将机会快照刷到 CSV |
-| `run_dashboard_loop` | Rich 全屏刷新（需 `signal_ui=dashboard`） |
 | `run_web_dashboard_loop` | HTTP + WebSocket 推送 JSON 给浏览器 |
 | `run_startup_revalidation_loop` | 屏障解除后执行各所 `startup_market_sweep`，校正从 DB 恢复的「伪活跃」行 |
 | `run_position_tracker_loop` | 周期性检查持仓与盈亏，触发告警或 `submit_exit` |
@@ -120,8 +118,9 @@
 ## 5. 自动交易与风控（概要）
 
 - **开仓**：`order_manager.submit_entry` 面向 **OKX / Deribit** REST：三腿限价并行提交、轮询成交、SQLite 记录 `positions` / `orders`。重复同合约同方向未平仓头寸会跳过。开仓前通过 `_check_and_cap_qty` 按账户余额约束下单量（默认最多 20%，预留 10%）。
-- **平仓**：`submit_exit` 读取开仓订单与当前盘口，下反向三腿；`position_tracker` 在浮盈或临近到期等条件下可调用。平仓失败时进入升级重试循环（maker→追单→taker），如有腿始终未成交则标记 `partial_failed`，由 `exit_monitor_loop` 守护协程自动接管重试。
-- **`arbitrage_enabled`**：在 `ExchangeConfig` 与 Web 载荷中标识「是否允许自动套利」意图；**若需用该开关硬关下单，应在调用链上增加显式判断**（与仅监控场景区分）。
+- **平仓**：`submit_exit` 读取开仓订单与当前盘口，下反向三腿；`position_tracker` 在浮盈或临近到期等条件下可调用。**OKX** 平仓前会核对交易所持仓与 DB 开仓一致；未全成时进入 `_escalating_exit_loop_okx`（maker→追单→taker）。**Deribit** 当前无同等内联升级循环，未全成时更多依赖 `exit_monitor_loop` 等路径。如有腿始终未成交则标记 `partial_failed`，由 `exit_monitor_loop` 守护协程按条件重试。
+- **`arbitrage_enabled`**：`signal_output` 在触发自动 `submit_entry` **之前**已检查该开关；为 false 时仅监控/通知，不创建下单任务。配置键与交易所名在解析时大小写不敏感。
+- **错误落库**：单腿/交易所失败原因优先写入 **`orders.last_error`**（成交成功等路径会清空），便于仪表盘按订单排查；详见 `order-flow.md`。
 
 ---
 
@@ -160,6 +159,7 @@ erDiagram
         real filled_px
         real qty
         text status
+        text last_error "失败原因，成交时可清空"
     }
     triplets {
         int id PK
@@ -240,6 +240,7 @@ erDiagram
 
 ## 8. 相关文档
 
+- [下单与撤单流程（与实现对齐）](order-flow.md)
 - [文档索引（上手路径）](README.md) — 主文档在 `docs/` 根下；`superpowers/` 内为可选历史规格，非必读。
 - [PCP 套利监控系统设计（原版）](superpowers/specs/2026-04-04-pcp-arbitrage-design.md)
 - [CCXT 适配设计（若涉及统一交易所抽象）](superpowers/specs/2026-04-04-ccxt-adapter-design.md)

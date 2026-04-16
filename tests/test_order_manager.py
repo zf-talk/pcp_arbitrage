@@ -30,6 +30,7 @@ def _make_db() -> sqlite3.Connection:
             expiry TEXT NOT NULL,
             strike REAL NOT NULL,
             direction TEXT NOT NULL,
+            target_state TEXT NOT NULL DEFAULT 'open',
             status TEXT NOT NULL DEFAULT 'open',
             realized_pnl_usdt REAL,
             opened_at TEXT NOT NULL,
@@ -49,6 +50,7 @@ def _make_db() -> sqlite3.Connection:
             leg TEXT NOT NULL,
             action TEXT NOT NULL,
             order_type TEXT NOT NULL DEFAULT 'limit',
+            requested_order_type TEXT NOT NULL DEFAULT 'limit',
             side TEXT NOT NULL,
             exchange_order_id TEXT,
             limit_px REAL NOT NULL,
@@ -61,7 +63,8 @@ def _make_db() -> sqlite3.Connection:
             actual_fee_usdt REAL,
             fee_ccy TEXT,
             submitted_at TEXT NOT NULL,
-            filled_at TEXT
+            filled_at TEXT,
+            last_error TEXT
         );
     """)
     conn.commit()
@@ -95,11 +98,13 @@ def _make_signal(triplet: Triplet, direction: str = "forward") -> ArbitrageSigna
         net_profit=50.0,
         annualized_return=0.10,
         days_to_expiry=30.0,
-        tradeable_qty=2.0,
+        index_for_fee_usdt=80000.0,
+        tradeable_qty=0.01,
+        depth_contracts=1.0,
     )
 
 
-def _make_cfg(is_paper: bool = True) -> AppConfig:
+def _make_cfg() -> AppConfig:
     return AppConfig(
         exchanges={
             "OKX": ExchangeConfig(
@@ -109,7 +114,6 @@ def _make_cfg(is_paper: bool = True) -> AppConfig:
                 api_key="test_key",
                 secret_key="test_secret",
                 passphrase="test_pass",
-                is_paper_trading=is_paper,
             )
         },
         symbols=["BTC"],
@@ -340,6 +344,35 @@ def _make_query_response(ord_id: str, state: str = "filled", avg_px: str = "100.
     return {"code": "0", "data": [{"ordId": ord_id, "state": state, "avgPx": avg_px, "px": avg_px}]}
 
 
+def test_okx_contracts_from_qty_btc_option_missing_ctmult():
+    """缺 ctMult 时不得默认 1.0，否则 0.01 BTC 名义会被算成 0.01 张（应为 1 张）。"""
+    from pcp_arbitrage import order_manager as om
+
+    inst = {
+        "instType": "OPTION",
+        "instId": "BTC-USD-260417-74500-C",
+        "ctValCcy": "BTC",
+        "ctVal": "1",
+    }
+    contracts = om._okx_contracts_from_qty_btc(inst, 0.01, future_mark_usd=None)
+    assert abs(contracts - 1.0) < 1e-9
+
+
+def test_okx_contracts_from_qty_btc_option_ctmult_one_implies_wrong_coin_per():
+    """接口若返回 ctMult=1（与 OKX BTC 期权 0.01 BTC/张 不符），按 0.01 BTC/张 修正。"""
+    from pcp_arbitrage import order_manager as om
+
+    inst = {
+        "instType": "OPTION",
+        "instId": "BTC-USD-260417-74500-C",
+        "ctValCcy": "BTC",
+        "ctVal": "1",
+        "ctMult": "1",
+    }
+    contracts = om._okx_contracts_from_qty_btc(inst, 0.01, future_mark_usd=None)
+    assert abs(contracts - 1.0) < 1e-9
+
+
 def _build_mock_session(
     post_order_ids: list[str] | None = None,
     query_states: list[str] | None = None,
@@ -381,6 +414,27 @@ def _build_mock_session(
         return _make_post_cm(post_order_ids[idx], raise_on_post and idx == 0)
 
     def _get_side_effect(*args, **kwargs):
+        path = str(args[0]) if args else ""
+        if "max-size" in path:
+            cm = MagicMock()
+            resp = MagicMock()
+            resp.raise_for_status = MagicMock()
+            resp.json = AsyncMock(
+                return_value={
+                    "code": "0",
+                    "msg": "",
+                    "data": [
+                        {
+                            "instId": kwargs.get("params", {}).get("instId", ""),
+                            "maxBuy": "9999",
+                            "maxSell": "9999",
+                        }
+                    ],
+                }
+            )
+            cm.__aenter__ = AsyncMock(return_value=resp)
+            cm.__aexit__ = AsyncMock(return_value=False)
+            return cm
         # Figure out which leg this is by ordId param
         params = kwargs.get("params", {})
         ord_id = params.get("ordId", "")
@@ -401,8 +455,43 @@ def _build_mock_session(
     return session_cm
 
 
+async def _mock_okx_get_instrument_for_tests(_sess, inst_id: str):
+    """与生产 OKX BTC-USD 期权 / 反向交割期货字段一致，用于下单张数换算测试。"""
+    if inst_id.endswith("-C") or inst_id.endswith("-P"):
+        return {
+            "instId": inst_id,
+            "instType": "OPTION",
+            "ctVal": "1",
+            "ctMult": "0.01",
+            "ctValCcy": "BTC",
+            "lotSz": "1",
+            "minSz": "1",
+        }
+    return {
+        "instId": inst_id,
+        "instType": "FUTURES",
+        "ctType": "inverse",
+        "ctVal": "100",
+        "ctValCcy": "USD",
+        "lotSz": "0.1",
+        "minSz": "0.1",
+    }
+
+
 class TestOrderManagerSubmitEntry:
     """Integration-style tests with mocked aiohttp and a real in-memory DB."""
+
+    @pytest.fixture(autouse=True)
+    def _mock_okx_preflight_max_size(self):
+        """避免测试请求真实 max-size；生产由 _okx_preflight_max_size_legs 校验。"""
+        with patch(
+            "pcp_arbitrage.order_manager._okx_preflight_max_size_legs",
+            new=AsyncMock(return_value=None),
+        ), patch(
+            "pcp_arbitrage.order_manager._okx_backfill_open_entry_orders_detail",
+            new=AsyncMock(return_value=None),
+        ):
+            yield
 
     @pytest.mark.asyncio
     async def test_has_open_position_guard_prevents_double_entry(self, tmp_path):
@@ -455,75 +544,12 @@ class TestOrderManagerSubmitEntry:
 
         from pcp_arbitrage import order_manager as om
 
-        with patch("aiohttp.ClientSession", return_value=session_mock):
+        with patch.object(om, "_okx_get_instrument", _mock_okx_get_instrument_for_tests), \
+             patch("aiohttp.ClientSession", return_value=session_mock):
             await om.submit_entry(triplet, signal, None, cfg, db_path)
 
         session = await session_mock.__aenter__()
         assert session.post.call_count == 3
-
-    @pytest.mark.asyncio
-    async def test_paper_trading_adds_simulated_header(self, tmp_path):
-        """When is_paper_trading=True, headers include x-simulated-trading: 1."""
-        db_path = str(tmp_path / "test.db")
-        _db.init_db(db_path)
-
-        triplet = _make_triplet()
-        signal = _make_signal(triplet)
-        cfg = _make_cfg(is_paper=True)
-
-        captured_headers: list[dict] = []
-
-        from pcp_arbitrage import order_manager as om
-
-        async def capturing_place_order(session, *, inst_id, td_mode, side, ord_type, px, sz,
-                                         api_key, secret, passphrase, is_paper):
-            """Capture headers but return a dummy order ID."""
-            from pcp_arbitrage.okx_client import _sign, _timestamp
-            import json as _json
-            path = "/api/v5/trade/order"
-            payload = {"instId": inst_id, "tdMode": td_mode, "side": side,
-                       "ordType": ord_type, "px": str(px), "sz": str(sz)}
-            body = _json.dumps(payload)
-            ts = _timestamp()
-            sig = _sign(secret, ts, "POST", path, body)
-            headers = {
-                "OK-ACCESS-KEY": api_key,
-                "OK-ACCESS-SIGN": sig,
-                "OK-ACCESS-TIMESTAMP": ts,
-                "OK-ACCESS-PASSPHRASE": passphrase,
-                "Content-Type": "application/json",
-            }
-            if is_paper:
-                headers["x-simulated-trading"] = "1"
-            captured_headers.append(dict(headers))
-            # Return a fake order ID (we're not hitting a real exchange)
-            return f"fake_ord_{inst_id}"
-
-        # Also mock poll so it immediately returns "filled"
-        async def mock_poll(session, *, inst_id, ord_id, api_key, secret, passphrase, is_paper,
-                             poll_interval=2.0, poll_timeout=30.0):
-            return {"ordId": ord_id, "state": "filled", "avgPx": "100.0", "px": "100.0"}
-
-        with patch.object(om, "_place_order", capturing_place_order), \
-             patch.object(om, "_poll_order_fill", mock_poll), \
-             patch("aiohttp.ClientSession") as mock_cls:
-            # We still need to mock the second session (for cancels, etc.)
-            mock_session_cm = MagicMock()
-            mock_session_inner = MagicMock()
-            mock_session_inner.post = MagicMock(return_value=MagicMock(
-                __aenter__=AsyncMock(return_value=MagicMock(raise_for_status=MagicMock())),
-                __aexit__=AsyncMock(return_value=False),
-            ))
-            mock_session_cm.__aenter__ = AsyncMock(return_value=mock_session_inner)
-            mock_session_cm.__aexit__ = AsyncMock(return_value=False)
-            mock_cls.return_value = mock_session_cm
-
-            await om.submit_entry(triplet, signal, None, cfg, db_path)
-
-        assert len(captured_headers) == 3
-        for h in captured_headers:
-            assert h.get("x-simulated-trading") == "1", \
-                f"Expected x-simulated-trading header, got: {h}"
 
     @pytest.mark.asyncio
     async def test_all_filled_sets_position_status_open(self, tmp_path):
@@ -538,14 +564,15 @@ class TestOrderManagerSubmitEntry:
         from pcp_arbitrage import order_manager as om
 
         async def mock_place(session, *, inst_id, td_mode, side, ord_type, px, sz,
-                              api_key, secret, passphrase, is_paper):
+                              api_key, secret, passphrase, **kwargs):
             return f"ord_{inst_id}"
 
-        async def mock_poll(session, *, inst_id, ord_id, api_key, secret, passphrase, is_paper,
-                             poll_interval=2.0, poll_timeout=30.0):
+        async def mock_poll(session, *, inst_id, ord_id, api_key, secret, passphrase,
+                             poll_interval=2.0, poll_timeout=30.0, **kwargs):
             return {"ordId": ord_id, "state": "filled", "avgPx": "100.0", "px": "100.0"}
 
-        with patch.object(om, "_place_order", mock_place), \
+        with patch.object(om, "_okx_get_instrument", _mock_okx_get_instrument_for_tests), \
+             patch.object(om, "_place_order", mock_place), \
              patch.object(om, "_poll_order_fill", mock_poll), \
              patch("aiohttp.ClientSession") as mock_cls:
             mock_session_cm = MagicMock()
@@ -576,25 +603,27 @@ class TestOrderManagerSubmitEntry:
         from pcp_arbitrage import order_manager as om
 
         async def mock_place(session, *, inst_id, td_mode, side, ord_type, px, sz,
-                              api_key, secret, passphrase, is_paper):
+                              api_key, secret, passphrase, **kwargs):
             return f"ord_{inst_id}"
 
         call_count = [0]
 
-        async def mock_poll(session, *, inst_id, ord_id, api_key, secret, passphrase, is_paper,
-                             poll_interval=2.0, poll_timeout=30.0):
+        async def mock_poll(session, *, inst_id, ord_id, api_key, secret, passphrase,
+                             poll_interval=2.0, poll_timeout=30.0, **kwargs):
             call_count[0] += 1
             # First leg fills, others time out
             if call_count[0] == 1:
                 return {"ordId": ord_id, "state": "filled", "avgPx": "100.0", "px": "100.0"}
             return None  # timeout
 
-        async def mock_cancel(session, *, inst_id, ord_id, api_key, secret, passphrase, is_paper):
+        async def mock_cancel(session, *, inst_id, ord_id, api_key, secret, passphrase, **kwargs):
             pass
 
-        with patch.object(om, "_place_order", mock_place), \
+        with patch.object(om, "_okx_get_instrument", _mock_okx_get_instrument_for_tests), \
+             patch.object(om, "_place_order", mock_place), \
              patch.object(om, "_poll_order_fill", mock_poll), \
              patch.object(om, "_cancel_order", mock_cancel), \
+             patch.object(om, "_fetch_order_book_top", new=AsyncMock(return_value=(100.0, 101.0))), \
              patch("aiohttp.ClientSession") as mock_cls:
             mock_session_cm = MagicMock()
             mock_session_inner = MagicMock()
@@ -637,12 +666,48 @@ class TestOrderManagerSubmitEntry:
             mock_cls.assert_not_called()
 
 
+@pytest.mark.asyncio
+async def test_okx_preflight_max_size_raises_when_below_sell_cap():
+    """计划张数超过 OKX max-size 返回的卖侧上限时拒绝开仓。"""
+    from pcp_arbitrage import order_manager as om
+
+    legs = [
+        {"leg": "call", "inst_id": "BTC-USD-250425-80000-C", "side": "buy", "px": 0.01},
+        {"leg": "put", "inst_id": "BTC-USD-250425-80000-P", "side": "sell", "px": 0.01},
+        {"leg": "future", "inst_id": "BTC-USD-250425", "side": "sell", "px": 80000.0},
+    ]
+    session = MagicMock()
+
+    async def fake_row(_session, *, inst_id: str, **kwargs):
+        if "80000-P" in inst_id:
+            return {"maxBuy": "99", "maxSell": "0.05"}
+        return {"maxBuy": "9999", "maxSell": "9999"}
+
+    with patch.object(om, "_okx_get_max_size_row", side_effect=fake_row):
+        with pytest.raises(RuntimeError, match="超过账户当前可卖上限"):
+            await om._okx_preflight_max_size_legs(
+                "t", session, legs, 1.0, "k", "s", "p"
+            )
+
+
 # ---------------------------------------------------------------------------
 # Tests for new behaviour introduced with exchange routing
 # ---------------------------------------------------------------------------
 
 class TestExchangeRouting:
     """Tests for same-exchange-only routing and lot-size rounding."""
+
+    @pytest.fixture(autouse=True)
+    def _mock_okx_preflight_max_size(self):
+        """与 TestOrderManagerSubmitEntry 相同，避免未 mock 的 session 误跑 max-size。"""
+        with patch(
+            "pcp_arbitrage.order_manager._okx_preflight_max_size_legs",
+            new=AsyncMock(return_value=None),
+        ), patch(
+            "pcp_arbitrage.order_manager._okx_backfill_open_entry_orders_detail",
+            new=AsyncMock(return_value=None),
+        ):
+            yield
 
     @pytest.mark.asyncio
     async def test_unsupported_exchange_skips_silently(self, tmp_path):
@@ -682,7 +747,6 @@ class TestExchangeRouting:
                     api_key="deribit_key",
                     secret_key="deribit_secret",
                     passphrase="",
-                    is_paper_trading=False,
                 )
             },
             symbols=["BTC"],
@@ -736,6 +800,7 @@ class TestExchangeRouting:
             return {"ordId": "oid_x", "state": "filled", "avgPx": "100.0", "px": "100.0"}
 
         with patch.object(om, "_submit_entry_deribit_inner", mock_deribit_inner), \
+             patch.object(om, "_okx_get_instrument", _mock_okx_get_instrument_for_tests), \
              patch.object(om, "_place_order", mock_place), \
              patch.object(om, "_poll_order_fill", mock_poll), \
              patch("aiohttp.ClientSession") as mock_cls:
@@ -771,7 +836,7 @@ class TestExchangeRouting:
 
     @pytest.mark.asyncio
     async def test_zero_qty_after_rounding_raises(self, tmp_path):
-        """submit_entry fails cleanly when tradeable_qty rounds down to zero."""
+        """submit_entry fails cleanly when tradeable_qty is zero."""
         from dataclasses import replace as dc_replace
 
         db_path = str(tmp_path / "test.db")
@@ -779,8 +844,7 @@ class TestExchangeRouting:
 
         triplet = _make_triplet(exchange="okx")
         signal = _make_signal(triplet)
-        # lot_size=0.01 in _make_cfg; 0.005 < 0.01 so floors to zero
-        signal = dc_replace(signal, tradeable_qty=0.005)
+        signal = dc_replace(signal, tradeable_qty=0.0)
         cfg = _make_cfg()
 
         from pcp_arbitrage import order_manager as om
@@ -799,7 +863,6 @@ class TestExchangeRouting:
     def test_deribit_futures_amount_calculation(self):
         """Deribit futures amount = round(qty * future_price / contract_size) * contract_size."""
         from pcp_arbitrage.pcp_calculator import DERIBIT_INVERSE_FUT_USD_FACE
-        import math
 
         # BTC: contract_size = 10 USD
         contract_size = DERIBIT_INVERSE_FUT_USD_FACE["BTC"]
@@ -823,8 +886,8 @@ async def test_escalating_exit_loop_taker_fallback(tmp_path):
     from pcp_arbitrage import order_manager as om
 
     cfg = mock.MagicMock()
-    cfg.exit_maker_chase_secs = 1
-    cfg.exit_taker_escalate_secs = 2
+    cfg.maker_chase_secs = 1
+    cfg.maker_chase_max_minutes = 3
 
     call_count = 0
 
@@ -842,23 +905,56 @@ async def test_escalating_exit_loop_taker_fallback(tmp_path):
         # Need to init DB for the function to query
         import sqlite3
         con = sqlite3.connect(str(tmp_path / "test.db"))
-        con.execute("CREATE TABLE positions (id INTEGER PRIMARY KEY, exit_attempt_count INTEGER DEFAULT 0, exit_last_attempt_at TEXT)")
-        con.execute("CREATE TABLE orders (id INTEGER PRIMARY KEY, position_id INTEGER, action TEXT, status TEXT, leg TEXT, inst_id TEXT, side TEXT)")
+        con.execute(
+            "CREATE TABLE positions ("
+            "id INTEGER PRIMARY KEY, "
+            "target_state TEXT NOT NULL DEFAULT 'open', "
+            "exit_attempt_count INTEGER DEFAULT 0, "
+            "exit_last_attempt_at TEXT)"
+        )
+        con.execute(
+            "CREATE TABLE orders (id INTEGER PRIMARY KEY, position_id INTEGER, action TEXT, status TEXT, "
+            "leg TEXT, inst_id TEXT, side TEXT, "
+            "filled_px REAL, filled_qty REAL, fee_type TEXT, actual_fee REAL, fee_ccy TEXT, filled_at TEXT, "
+            "order_type TEXT, last_error TEXT)"
+        )
+        con.execute(
+            "INSERT INTO orders (id, position_id, action, status, leg, inst_id, side, last_error) "
+            "VALUES (1, 1, 'close', 'pending', 'call', 'BTC-USD-C', 'sell', NULL)"
+        )
         con.commit()
         con.close()
 
         filled, pnl = await om._escalating_exit_loop_okx(
             session=mock.AsyncMock(),
-            failed_legs=[{"leg": "call", "inst_id": "BTC-USD-C", "side": "sell",
-                          "entry_px": 90.0, "oid_db": 1, "last_px": 100.0, "exch_ord_id": None}],
-            qty=0.01, position_id=1, signal_id=None,
-            api_key="k", secret="s", passphrase="p", is_paper=True,
+            failed_legs=[{
+                "leg": "call",
+                "inst_id": "BTC-USD-C",
+                "side": "sell",
+                "qty": 1.0,
+                "entry_px": 90.0,
+                "oid_db": 1,
+                "last_px": 100.0,
+                "exch_ord_id": None,
+            }],
+            position_id=1,
+            signal_id=None,
+            api_key="k",
+            secret="s",
+            passphrase="p",
             sqlite_path=str(tmp_path / "test.db"),
-            exit_started_at=started_at, cfg=cfg,
+            exit_started_at=started_at,
+            cfg=cfg,
         )
     assert filled is True
     assert pnl == 10.0
     assert call_count == 2
+    con = sqlite3.connect(str(tmp_path / "test.db"))
+    row = con.execute("SELECT status, last_error FROM orders WHERE id=1").fetchone()
+    con.close()
+    assert row is not None
+    assert row[0] == "canceled"
+    assert "策略撤单" in str(row[1] or "")
 
 
 # ---------------------------------------------------------------------------
@@ -910,3 +1006,120 @@ async def test_check_and_cap_qty_reserve_insufficient():
             exchange_cfg=mock.MagicMock(), app_cfg=cfg, lot_size=0.01,
         )
     assert result == 0.0
+
+
+@pytest.mark.asyncio
+async def test_reconcile_close_orders_status_updates_failed_to_filled(tmp_path):
+    from pcp_arbitrage import order_manager as om
+
+    db_path = str(tmp_path / "reconcile_close.db")
+    _db.init_db(db_path)
+    cfg = _make_cfg()
+    cfg.sqlite_path = db_path
+
+    conn = sqlite3.connect(db_path)
+    try:
+        with conn:
+            pid = _db.create_position(
+                conn,
+                signal_id=None,
+                exchange="OKX",
+                symbol="BTC",
+                expiry="250425",
+                strike=80000.0,
+                direction="forward",
+            )
+            oid = _db.create_order(
+                conn,
+                signal_id=None,
+                position_id=pid,
+                inst_id="BTC-USD-250425-80000-C",
+                leg="call",
+                action="close",
+                side="sell",
+                limit_px=0.01,
+                qty=1.0,
+                exchange_order_id="oid_close_1",
+            )
+            _db.update_order_status(conn, oid, "failed")
+    finally:
+        conn.close()
+
+    snap = {
+        "ordId": "oid_close_1",
+        "state": "filled",
+        "avgPx": "0.0123",
+        "px": "0.0123",
+        "fillSz": "1",
+        "ordType": "limit",
+        "fee": "-0.00001",
+        "feeCcy": "BTC",
+        "execType": "M",
+    }
+    with patch.object(om, "_okx_get_order_snapshot", AsyncMock(return_value=snap)):
+        stats = await om.reconcile_close_orders_status(
+            position_id=pid,
+            cfg=cfg,
+            sqlite_path=db_path,
+        )
+    assert stats["filled"] == 1
+    conn = sqlite3.connect(db_path)
+    row = conn.execute("SELECT status, filled_px, fee_type FROM orders WHERE id=?", (oid,)).fetchone()
+    conn.close()
+    assert row is not None
+    assert row[0] == "filled"
+    assert row[1] == pytest.approx(0.0123)
+    assert row[2] == "taker"
+
+
+@pytest.mark.asyncio
+async def test_reconcile_close_orders_status_updates_failed_to_pending_on_live(tmp_path):
+    from pcp_arbitrage import order_manager as om
+
+    db_path = str(tmp_path / "reconcile_close_live.db")
+    _db.init_db(db_path)
+    cfg = _make_cfg()
+    cfg.sqlite_path = db_path
+
+    conn = sqlite3.connect(db_path)
+    try:
+        with conn:
+            pid = _db.create_position(
+                conn,
+                signal_id=None,
+                exchange="OKX",
+                symbol="BTC",
+                expiry="250425",
+                strike=80000.0,
+                direction="forward",
+            )
+            oid = _db.create_order(
+                conn,
+                signal_id=None,
+                position_id=pid,
+                inst_id="BTC-USD-250425-80000-P",
+                leg="put",
+                action="close",
+                side="buy",
+                limit_px=0.02,
+                qty=1.0,
+                exchange_order_id="oid_close_2",
+            )
+            _db.update_order_status(conn, oid, "failed")
+    finally:
+        conn.close()
+
+    snap = {"ordId": "oid_close_2", "state": "live", "px": "0.02", "ordType": "limit"}
+    with patch.object(om, "_okx_get_order_snapshot", AsyncMock(return_value=snap)):
+        stats = await om.reconcile_close_orders_status(
+            position_id=pid,
+            cfg=cfg,
+            sqlite_path=db_path,
+        )
+    assert stats["pending"] == 1
+    conn = sqlite3.connect(db_path)
+    row = conn.execute("SELECT status, last_error FROM orders WHERE id=?", (oid,)).fetchone()
+    conn.close()
+    assert row is not None
+    assert row[0] == "pending"
+    assert "等待成交中" in (row[1] or "")

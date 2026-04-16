@@ -19,6 +19,7 @@ def fee_rates():
 @pytest.fixture
 def triplet():
     return Triplet(
+        exchange="okx",
         symbol="BTC",
         expiry="250425",
         strike=95000.0,
@@ -65,7 +66,7 @@ def test_forward_net_profit_less_than_gross(triplet, books_forward, fee_rates):
 
 
 def test_forward_tradeable_qty_is_min_of_three_legs(triplet, fee_rates):
-    """正向：买 C@ask、卖 P@bid、卖 F@bid — min(call_ask_sz, put_bid_sz, fut_bid_sz)."""
+    """正向：各腿张数换算为 BTC 名义后取 min（与余额约束 qty×index 一致）。"""
     books = {
         "BTC-USD-250425-95000-C": BookSnapshot(
             bid=200.0, ask=200.0, ts=NOW_MS, bid_sz=999.0, ask_sz=10.0
@@ -79,11 +80,13 @@ def test_forward_tradeable_qty_is_min_of_three_legs(triplet, fee_rates):
     }
     sig = calculate_forward(triplet, books, fee_rates, lot_size=0.01, days_to_expiry=21.0, spot_price=1.0)
     assert sig is not None
-    assert sig.tradeable_qty == pytest.approx(5.0)
+    # call 10×0.01=0.1, put 5×0.01=0.05, fut 100×0.01=1.0（无 inverse 面值时用 lot_size）→ min=0.05
+    assert sig.tradeable_qty == pytest.approx(0.05)
+    assert sig.depth_contracts == pytest.approx(min(10.0, 5.0, 100.0))
 
 
 def test_reverse_tradeable_qty_is_min_of_three_legs(triplet, fee_rates):
-    """反向：卖 C@bid、买 P@ask、买 F@ask — min(call_bid_sz, put_ask_sz, fut_ask_sz)."""
+    """反向：各腿换算 BTC 名义后取 min。"""
     books = {
         "BTC-USD-250425-95000-C": BookSnapshot(
             bid=120.0, ask=120.0, ts=NOW_MS, bid_sz=3.0, ask_sz=9.0
@@ -97,7 +100,41 @@ def test_reverse_tradeable_qty_is_min_of_three_legs(triplet, fee_rates):
     }
     sig = calculate_reverse(triplet, books, fee_rates, lot_size=0.01, days_to_expiry=21.0, spot_price=1.0)
     assert sig is not None
-    assert sig.tradeable_qty == pytest.approx(3.0)
+    # 3×0.01, 40×0.01, 7×0.01 → min=0.03
+    assert sig.tradeable_qty == pytest.approx(0.03)
+    assert sig.depth_contracts == pytest.approx(min(3.0, 40.0, 7.0))
+
+
+def test_tradeable_uses_inverse_future_usd_face_when_set(triplet, fee_rates):
+    """币本位反向期货深度用 USD 面值/指数 换算 BTC 名义。"""
+    books = {
+        "BTC-USD-250425-95000-C": BookSnapshot(
+            bid=200.0, ask=200.0, ts=NOW_MS, ask_sz=10.0
+        ),
+        "BTC-USD-250425-95000-P": BookSnapshot(
+            bid=5600.0, ask=5600.0, ts=NOW_MS, bid_sz=5.0
+        ),
+        "BTC-USD-250425": BookSnapshot(
+            bid=89630.0, ask=89640.0, ts=NOW_MS, bid_sz=100000.0
+        ),
+    }
+    spot = 100_000.0
+    face = 100.0
+    sig = calculate_forward(
+        triplet,
+        books,
+        fee_rates,
+        lot_size=0.01,
+        days_to_expiry=21.0,
+        spot_price=spot,
+        future_inverse_usd_face=face,
+    )
+    assert sig is not None
+    c = 10.0 * 0.01
+    p = 5.0 * 0.01
+    f = 100_000.0 * (face / spot)  # 0.1
+    assert sig.tradeable_qty == pytest.approx(min(c, p, f))
+    assert sig.tradeable_qty == pytest.approx(0.05)
 
 
 def test_forward_returns_none_when_not_profitable(triplet, fee_rates):
@@ -127,9 +164,9 @@ def test_option_fee_cap_clamps_high_rate():
     """When fee_by_face > cap, cap is returned."""
     from pcp_arbitrage.pcp_calculator import _option_fee
 
-    # fee_by_face = 100 × 1.0 × 1.0 = 100; fee_cap = 0.001 × 100 × 0.125 = 0.0125 → cap wins
+    # fee_by_face = 100 × 1.0 × 1.0 = 100; fee_cap = 0.001 × 100 × 0.07 → cap wins
     fee = _option_fee(option_price=0.001, lot_size=100.0, option_rate=1.0, index_usdt=1.0)
-    assert fee == pytest.approx(0.001 * 100.0 * 0.125)
+    assert fee == pytest.approx(0.001 * 100.0 * 0.07)
 
 
 def test_option_fee_uses_underlying_index():
